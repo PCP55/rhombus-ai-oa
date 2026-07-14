@@ -42,7 +42,7 @@ def upload_file(request):
     return JsonResponse({"error": "Invalid request method"}, status=405)
 
 
-def check_status(job_id):
+def check_status(request, job_id):
     """Returns the current progress and data of a specific job."""
     try:
         job = ProcessingJob.objects.get(id=job_id)
