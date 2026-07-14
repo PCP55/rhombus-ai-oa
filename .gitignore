@@ -1,0 +1,43 @@
+# Secrets & environment variables
+.env
+.env.local
+.env.*.local
+.secret
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyc
+build/
+dist/
+wheels/
+*.egg-info
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Database
+db.sqlite3
+db.sqlite3-journal
+
+# Django
+media/
+
+# Node.js
+node_modules/
+.next/
+out/
+.eslintcache
+
+# Logs
+*.log
+
+# IDEs
+.vscode/
+.idea/
+
+# OS generated files
+.DS_Store
+Thumbs.db
