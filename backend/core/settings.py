@@ -13,20 +13,45 @@ https://docs.djangoproject.com/en/6.0/ref/settings/
 import os
 from pathlib import Path
 
+from corsheaders.defaults import default_headers
+from dotenv import load_dotenv
+
+# Loads backend/.env for local development. In Docker/production, real
+# environment variables (from docker-compose/the host) take precedence over
+# anything load_dotenv() finds, so this is safe to call unconditionally.
+load_dotenv()
+
 # Build paths inside the project like this: BASE_DIR / 'subdir'.
 BASE_DIR = Path(__file__).resolve().parent.parent
 
 
-# Quick-start development settings - unsuitable for production
-# See https://docs.djangoproject.com/en/6.0/howto/deployment/checklist/
+def _get_bool_env(name: str, default: bool = False) -> bool:
+    return os.environ.get(name, str(default)).strip().lower() in ("1", "true", "yes", "on")
 
-# SECURITY WARNING: keep the secret key used in production secret!
-SECRET_KEY = "django-insecure-0782bb7l*ov(l(bc6xz84ldq9*p&m#=xqjr%k&^0d*i7)&))p("
+
+def _get_list_env(name: str, default: str = "") -> list[str]:
+    return [item.strip() for item in os.environ.get(name, default).split(",") if item.strip()]
+
 
 # SECURITY WARNING: don't run with debug turned on in production!
-DEBUG = True
+DEBUG = _get_bool_env("DJANGO_DEBUG", False)
 
-ALLOWED_HOSTS = ["170.64.237.178", "localhost", "127.0.0.1", "0.0.0.0"]
+# SECURITY WARNING: keep the secret key used in production secret!
+# Must be set via the DJANGO_SECRET_KEY env var outside of local dev — fail
+# fast instead of silently deploying with a key that's public on GitHub.
+SECRET_KEY = os.environ.get("DJANGO_SECRET_KEY")
+if not SECRET_KEY:
+    if DEBUG:
+        SECRET_KEY = "django-insecure-local-dev-only-do-not-use-in-prod"
+    else:
+        raise RuntimeError(
+            "DJANGO_SECRET_KEY environment variable must be set when DEBUG=False. "
+            "Generate one with: python -c \"from django.core.management.utils import "
+            "get_random_secret_key; print(get_random_secret_key())\""
+        )
+
+# Comma-separated list, e.g. "yourdomain.com,api.yourdomain.com,203.0.113.10"
+ALLOWED_HOSTS = _get_list_env("DJANGO_ALLOWED_HOSTS", "localhost,127.0.0.1")
 
 
 # Application definition
@@ -50,6 +75,10 @@ MIDDLEWARE = [
     "django.contrib.auth.middleware.AuthenticationMiddleware",
     "django.contrib.messages.middleware.MessageMiddleware",
     "django.middleware.clickjacking.XFrameOptionsMiddleware",
+    # Gate the whole app behind a shared secret when APP_ACCESS_KEY is set, so
+    # a publicly reachable droplet is only usable by whoever you hand the key
+    # to. No-ops when APP_ACCESS_KEY is unset (e.g. local development).
+    "api.middleware.RequireAccessKeyMiddleware",
 ]
 
 ROOT_URLCONF = "core.urls"
@@ -133,9 +162,27 @@ CELERY_TASK_SERIALIZER = "json"
 MEDIA_URL = "/media/"
 MEDIA_ROOT = os.path.join(BASE_DIR, "media")
 
-CORS_ALLOWED_ORIGINS = [
-    "http://localhost:3000",
-]
+CORS_ALLOWED_ORIGINS = _get_list_env("DJANGO_CORS_ALLOWED_ORIGINS", "http://localhost:3000")
+
+# django-cors-headers only allows a small default header set through its
+# preflight checks — X-Access-Key (see api/middleware.py) needs to be added
+# explicitly or the browser blocks it before the request ever reaches Django.
+CORS_ALLOW_HEADERS = list(default_headers) + ["x-access-key"]
+
+# Needed for Django's own CSRF checks (admin login, etc.) once this is served
+# over HTTPS from a real domain instead of localhost.
+CSRF_TRUSTED_ORIGINS = _get_list_env("DJANGO_CSRF_TRUSTED_ORIGINS")
+
+# Production hardening — only takes effect once you've actually got TLS
+# terminating in front of this app (e.g. via Nginx/Caddy + Let's Encrypt).
+# Left off by default so it doesn't break you before HTTPS is set up.
+if not DEBUG and _get_bool_env("DJANGO_BEHIND_HTTPS_PROXY", False):
+    SECURE_PROXY_SSL_HEADER = ("HTTP_X_FORWARDED_PROTO", "https")
+    SECURE_SSL_REDIRECT = True
+    SESSION_COOKIE_SECURE = True
+    CSRF_COOKIE_SECURE = True
+    SECURE_HSTS_SECONDS = 60 * 60 * 24 * 30
+    SECURE_HSTS_INCLUDE_SUBDOMAINS = True
 
 CACHES = {
     "default": {

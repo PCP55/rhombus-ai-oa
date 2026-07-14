@@ -1,6 +1,7 @@
 "use client";
 
 import { useState, useEffect } from "react";
+import { apiFetch } from "../lib/api";
 
 interface ResultsTableProps {
     jobId: string;
@@ -17,8 +18,8 @@ export default function ResultsTable({ jobId }: ResultsTableProps) {
         const fetchPage = async () => {
             setIsLoading(true);
             try {
-                const res = await fetch(
-                    `http://localhost:8000/api/results/${jobId}/?page=${currentPage}`,
+                const res = await apiFetch(
+                    `/api/results/${jobId}/?page=${currentPage}`,
                 );
                 const json = await res.json();
 

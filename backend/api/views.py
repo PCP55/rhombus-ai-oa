@@ -10,7 +10,6 @@ from .models import ProcessingJob
 from .tasks import process_file_task
 
 
-# csrf_exempt allows us to test the API without setting up security tokens just yet
 @csrf_exempt
 def upload_file(request):
     if request.method == "POST":
