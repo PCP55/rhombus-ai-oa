@@ -68,10 +68,19 @@ INSTALLED_APPS = [
 ]
 
 MIDDLEWARE = [
-    # Reject oversized request bodies (e.g. a huge upload) before Django
-    # buffers any of it into memory/disk -- runs first, ahead of everything else.
-    "api.middleware.MaxUploadSizeMiddleware",
+    # CorsMiddleware must be as high/outer as possible (django-cors-headers'
+    # own recommendation): every middleware below it can short-circuit with
+    # its own response (MaxUploadSizeMiddleware's 413, RequireAccessKeyMiddleware's
+    # 401, etc.), and only the middleware *outside* CorsMiddleware would miss
+    # out on having CORS headers attached. Listing it first means it wraps
+    # everything else, so ALL responses -- short-circuited or not -- get
+    # CORS headers before reaching the browser. Get this wrong and the
+    # browser just silently blocks the response with no visible error.
     "corsheaders.middleware.CorsMiddleware",
+    # Reject oversized request bodies (e.g. a huge upload) before Django
+    # buffers any of it into memory/disk -- runs early, but still inside
+    # CorsMiddleware so its 413 responses are CORS-visible to the frontend.
+    "api.middleware.MaxUploadSizeMiddleware",
     "django.middleware.security.SecurityMiddleware",
     "django.contrib.sessions.middleware.SessionMiddleware",
     "django.middleware.csrf.CsrfViewMiddleware",
