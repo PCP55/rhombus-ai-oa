@@ -13,18 +13,10 @@ from .tasks import process_file_task, read_columns_task
 
 logger = logging.getLogger(__name__)
 
-# Only these are ever handed to the Excel->CSV converter or read directly by
-# Spark (see tasks.py / services/spark.py) — reject anything else up front
-# instead of letting it fail deep inside a background worker.
+
 ALLOWED_UPLOAD_EXTENSIONS = (".csv", ".xls", ".xlsx")
 
 
-# @csrf_exempt is correct here, not just a shortcut: Django's CSRF protection
-# defends session-cookie-authenticated requests from being forged by another
-# site. This API is stateless (no login session/cookie), called cross-origin
-# by the Next.js frontend via fetch(), so there's no CSRF token to check in
-# the first place. Real authorization is handled instead by
-# RequireAccessKeyMiddleware (APP_ACCESS_KEY) + CORS_ALLOWED_ORIGINS.
 @csrf_exempt
 def upload_file(request):
     """
@@ -59,8 +51,6 @@ def upload_file(request):
         return JsonResponse({"job_id": str(job.id), "status": job.status})
 
     except OSError:
-        # Disk full, permission denied, temp-dir too small, etc. -- common when
-        # a multi-GB upload lands on a small droplet.
         logger.exception("Failed to store uploaded file for upload request")
         if job:
             job.delete()
@@ -106,10 +96,6 @@ def submit_job(request, job_id):
             status=400,
         )
 
-    # The frontend only ever offers columns from job.columns (populated by
-    # read_columns_task), but the API itself must not trust that -- validate
-    # server-side against what was actually read from the file, rather than
-    # letting a client-supplied column name reach Spark unchecked.
     if target_column not in job.columns:
         return JsonResponse(
             {
@@ -153,7 +139,6 @@ def check_status(request, job_id):
             if isinstance(task_result.info, dict):
                 response_data["progress_detail"] = task_result.info
 
-        # Only include the heavy dataset if the job is actually finished
         if job.status == "SUCCESS":
             response_data["result_data"] = job.result_data
         elif job.status == "FAILED":
@@ -170,7 +155,7 @@ def check_status(request, job_id):
         return JsonResponse({"error": "Job not found"}, status=404)
 
 
-@csrf_exempt  # see note on upload_file — no session cookie, so no CSRF token applies
+@csrf_exempt
 def cancel_job(request, job_id):
     if request.method == "POST":
         try:
@@ -221,10 +206,10 @@ def get_paginated_results(request, job_id):
             {"error": "Data processing is not complete yet."}, status=400
         )
 
-    # 1. Parse Pagination Parameters (Default to page 1, 50 rows per page)
+    # 1. Parse Pagination Parameters (Default to page 1, 25 rows per page)
     try:
         page = int(request.GET.get("page", 1))
-        limit = int(request.GET.get("limit", 50))
+        limit = int(request.GET.get("limit", 25))
     except ValueError:
         return JsonResponse({"error": "Invalid page or limit parameters."}, status=400)
 
@@ -244,7 +229,7 @@ def get_paginated_results(request, job_id):
         total_rows = lazy_df.select(pl.len()).collect().item()
         total_pages = (total_rows + limit - 1) // limit
 
-        # 5. Extract just the 50 rows we need
+        # 5. Extract just the 25 rows we need
         offset = (page - 1) * limit
         chunk_df = lazy_df.slice(offset, limit).collect()
 

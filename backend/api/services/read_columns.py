@@ -18,18 +18,8 @@ def read_columns(file_path: str) -> list[str]:
     extension = os.path.splitext(file_path)[1].lower()
 
     if extension in (".xlsx", ".xls"):
-        # Excel files are always fully loaded into memory elsewhere in this
-        # pipeline too (see the Excel->CSV conversion step in tasks.py), so
-        # there's no lighter-weight read available here worth the extra
-        # complexity -- these files are never the "millions of rows" case
-        # PySpark is responsible for.
         return pl.read_excel(file_path).columns
 
-    # CSV: read only the first physical line rather than letting Polars scan
-    # the file, so this stays instant even for a multi-GB upload. Python's
-    # csv module (not a naive `line.split(",")`) correctly handles a quoted
-    # header value that itself contains a comma or newline.
-    #
     # Try a few common encodings -- real-world CSV exports aren't always UTF-8.
     last_decode_error: UnicodeDecodeError | None = None
     for encoding in ("utf-8-sig", "utf-8", "latin-1"):
