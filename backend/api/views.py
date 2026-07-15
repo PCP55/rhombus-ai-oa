@@ -1,3 +1,4 @@
+import logging
 import os
 
 import polars as pl
@@ -8,43 +9,115 @@ from django.shortcuts import get_object_or_404
 from django.views.decorators.csrf import csrf_exempt
 
 from .models import ProcessingJob
-from .tasks import process_file_task
+from .tasks import process_file_task, read_columns_task
+
+logger = logging.getLogger(__name__)
 
 
-# @csrf_exempt is correct here, not just a shortcut: Django's CSRF protection
-# defends session-cookie-authenticated requests from being forged by another
-# site. This API is stateless (no login session/cookie), called cross-origin
-# by the Next.js frontend via fetch(), so there's no CSRF token to check in
-# the first place. Real authorization is handled instead by
-# RequireAccessKeyMiddleware (APP_ACCESS_KEY) + CORS_ALLOWED_ORIGINS.
+ALLOWED_UPLOAD_EXTENSIONS = (".csv", ".xls", ".xlsx")
+
+
 @csrf_exempt
 def upload_file(request):
-    if request.method == "POST":
-        # 1. Grab the file and text data from the incoming request
-        file = request.FILES.get("file")
-        target_column = request.POST.get("target_column")
-        prompt = request.POST.get("prompt")
-        replacement_value = request.POST.get("replacement_value", "")
+    """
+    Step 1 of 2: stores the uploaded file and queues background column
+    discovery. The web process only saves the file — parsing happens in
+    read_columns_task. The frontend polls /api/status/ until columns appear.
+    """
+    if request.method != "POST":
+        return JsonResponse({"error": "Invalid request method"}, status=405)
 
-        if not all([file, target_column, prompt]):
-            return JsonResponse({"error": "Missing required fields"}, status=400)
+    file = request.FILES.get("file")
+    if not file:
+        return JsonResponse({"error": "Missing required field: file"}, status=400)
 
-        # 2. Create the "receipt" in the database
-        job = ProcessingJob.objects.create(
-            file=file,
-            target_column=target_column,
-            prompt=prompt,
-            replacement_value=replacement_value,
+    if not file.name.lower().endswith(ALLOWED_UPLOAD_EXTENSIONS):
+        return JsonResponse(
+            {
+                "error": (
+                    f"Unsupported file type '{file.name}'. Only "
+                    f"{', '.join(ALLOWED_UPLOAD_EXTENSIONS)} files are accepted."
+                )
+            },
+            status=400,
         )
 
-        # 3. Hand the ticket to Celery, pinning the Celery task_id to the job_id
-        # so the polling API can look up this task's live state later.
-        process_file_task.apply_async(args=[job.id], task_id=str(job.id))
+    job = None
+    try:
+        job = ProcessingJob.objects.create(file=file)  # status defaults to DRAFT
 
-        # 4. Instantly return the Job ID to the user
-        return JsonResponse({"job_id": job.id, "status": "QUEUED"}, status=201)
+        read_columns_task.apply_async(args=[job.id], task_id=f"{job.id}-columns")
 
-    return JsonResponse({"error": "Invalid request method"}, status=405)
+        return JsonResponse({"job_id": str(job.id), "status": job.status})
+
+    except OSError:
+        logger.exception("Failed to store uploaded file for upload request")
+        if job:
+            job.delete()
+        return JsonResponse(
+            {
+                "error": (
+                    "The server could not store this file. It may be out of disk "
+                    "space, or the upload may exceed the configured size limit."
+                )
+            },
+            status=507,
+        )
+
+
+@csrf_exempt  # see note on upload_file above — no session cookie, so no CSRF token applies
+def submit_job(request, job_id):
+    """
+    Step 2 of 2: attaches the target column / NL prompt / replacement value
+    the user picked (after column discovery completes) to an existing DRAFT
+    job, then queues it for Celery processing.
+    """
+    if request.method != "POST":
+        return JsonResponse({"error": "Invalid request method"}, status=405)
+
+    job = get_object_or_404(ProcessingJob, id=job_id)
+
+    if job.status != "DRAFT":
+        return JsonResponse(
+            {"error": f"Job has already been submitted (status: {job.status})."},
+            status=400,
+        )
+
+    target_column = request.POST.get("target_column")
+    prompt = request.POST.get("prompt")
+    replacement_value = request.POST.get("replacement_value", "")
+
+    if not all([target_column, prompt]):
+        return JsonResponse({"error": "Missing required fields"}, status=400)
+
+    if not job.columns:
+        return JsonResponse(
+            {"error": "Column discovery is still in progress. Please wait."},
+            status=400,
+        )
+
+    if target_column not in job.columns:
+        return JsonResponse(
+            {
+                "error": (
+                    f"'{target_column}' is not a column in the uploaded file. "
+                    f"Available columns: {', '.join(job.columns)}"
+                )
+            },
+            status=400,
+        )
+
+    job.target_column = target_column
+    job.prompt = prompt
+    job.replacement_value = replacement_value
+    job.status = "QUEUED"
+    job.save()
+
+    # Pin the Celery task_id to the job_id so the polling API can look up
+    # this task's live state later.
+    process_file_task.apply_async(args=[job.id], task_id=str(job.id))
+
+    return JsonResponse({"job_id": job.id, "status": "QUEUED"}, status=202)
 
 
 def check_status(request, job_id):
@@ -66,11 +139,15 @@ def check_status(request, job_id):
             if isinstance(task_result.info, dict):
                 response_data["progress_detail"] = task_result.info
 
-        # Only include the heavy dataset if the job is actually finished
         if job.status == "SUCCESS":
             response_data["result_data"] = job.result_data
         elif job.status == "FAILED":
             response_data["error_message"] = job.error_message
+
+        # Expose columns while the job is still a draft so the frontend can
+        # poll after upload until background column discovery completes.
+        if job.status == "DRAFT":
+            response_data["columns"] = job.columns
 
         return JsonResponse(response_data)
 
@@ -78,11 +155,19 @@ def check_status(request, job_id):
         return JsonResponse({"error": "Job not found"}, status=404)
 
 
-@csrf_exempt  # see note on upload_file — no session cookie, so no CSRF token applies
+@csrf_exempt
 def cancel_job(request, job_id):
     if request.method == "POST":
         try:
             job = ProcessingJob.objects.get(id=job_id)
+
+            if job.status == "DRAFT":
+                # Discard draft and stop any in-flight column discovery task.
+                current_app.control.revoke(
+                    f"{job.id}-columns", terminate=True, signal="SIGKILL"
+                )
+                job.delete()
+                return JsonResponse({"message": "Draft job discarded."})
 
             # Only cancel if it's currently active
             if job.status in ["QUEUED", "RUNNING"]:
@@ -121,10 +206,10 @@ def get_paginated_results(request, job_id):
             {"error": "Data processing is not complete yet."}, status=400
         )
 
-    # 1. Parse Pagination Parameters (Default to page 1, 50 rows per page)
+    # 1. Parse Pagination Parameters (Default to page 1, 25 rows per page)
     try:
         page = int(request.GET.get("page", 1))
-        limit = int(request.GET.get("limit", 50))
+        limit = int(request.GET.get("limit", 25))
     except ValueError:
         return JsonResponse({"error": "Invalid page or limit parameters."}, status=400)
 
@@ -144,7 +229,7 @@ def get_paginated_results(request, job_id):
         total_rows = lazy_df.select(pl.len()).collect().item()
         total_pages = (total_rows + limit - 1) // limit
 
-        # 5. Extract just the 50 rows we need
+        # 5. Extract just the 25 rows we need
         offset = (page - 1) * limit
         chunk_df = lazy_df.slice(offset, limit).collect()
 
@@ -164,5 +249,9 @@ def get_paginated_results(request, job_id):
             }
         )
 
-    except Exception as e:
-        return JsonResponse({"error": str(e)}, status=500)
+    except Exception:
+        logger.exception("Failed to read paginated results for job %s", job.id)
+        return JsonResponse(
+            {"error": "Could not read the processed results for this job."},
+            status=500,
+        )

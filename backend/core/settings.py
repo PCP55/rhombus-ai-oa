@@ -68,7 +68,19 @@ INSTALLED_APPS = [
 ]
 
 MIDDLEWARE = [
+    # CorsMiddleware must be as high/outer as possible (django-cors-headers'
+    # own recommendation): every middleware below it can short-circuit with
+    # its own response (MaxUploadSizeMiddleware's 413, RequireAccessKeyMiddleware's
+    # 401, etc.), and only the middleware *outside* CorsMiddleware would miss
+    # out on having CORS headers attached. Listing it first means it wraps
+    # everything else, so ALL responses -- short-circuited or not -- get
+    # CORS headers before reaching the browser. Get this wrong and the
+    # browser just silently blocks the response with no visible error.
     "corsheaders.middleware.CorsMiddleware",
+    # Reject oversized request bodies (e.g. a huge upload) before Django
+    # buffers any of it into memory/disk -- runs early, but still inside
+    # CorsMiddleware so its 413 responses are CORS-visible to the frontend.
+    "api.middleware.MaxUploadSizeMiddleware",
     "django.middleware.security.SecurityMiddleware",
     "django.contrib.sessions.middleware.SessionMiddleware",
     "django.middleware.csrf.CsrfViewMiddleware",
@@ -162,6 +174,13 @@ CELERY_TASK_SERIALIZER = "json"
 MEDIA_URL = "/media/"
 MEDIA_ROOT = os.path.join(BASE_DIR, "media")
 
+# Large uploads (> FILE_UPLOAD_MAX_MEMORY_SIZE, default 2.5MB) are spooled to
+# disk while Django parses the multipart body. Point that temp dir at the same
+# mounted volume as MEDIA_ROOT instead of the container's /tmp -- on a small
+# droplet /tmp is often a memory-backed tmpfs that can't hold a multi-GB file.
+FILE_UPLOAD_TEMP_DIR = os.path.join(MEDIA_ROOT, ".upload-tmp")
+os.makedirs(FILE_UPLOAD_TEMP_DIR, exist_ok=True)
+
 CORS_ALLOWED_ORIGINS = _get_list_env("DJANGO_CORS_ALLOWED_ORIGINS", "http://localhost:3000")
 
 # django-cors-headers only allows a small default header set through its
@@ -192,4 +211,31 @@ CACHES = {
             "CLIENT_CLASS": "django_redis.client.DefaultClient",
         },
     }
+}
+
+# Without this, Django's default logging config only surfaces WARNING+ to
+# the console (via Python's logging.lastResort handler) -- any logger.info()
+# call in our own code (api/tasks.py, api/services/*, api/views.py) would be
+# silently dropped instead of showing up in `docker compose logs worker`/`web`
+# the way print() used to. disable_existing_loggers stays False (the
+# default) so Django's own request/server logging is untouched; this just
+# adds a root handler everything else propagates up into.
+LOGGING = {
+    "version": 1,
+    "disable_existing_loggers": False,
+    "formatters": {
+        "simple": {
+            "format": "%(asctime)s %(levelname)s %(name)s: %(message)s",
+        },
+    },
+    "handlers": {
+        "console": {
+            "class": "logging.StreamHandler",
+            "formatter": "simple",
+        },
+    },
+    "root": {
+        "handlers": ["console"],
+        "level": "INFO",
+    },
 }

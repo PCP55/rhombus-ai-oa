@@ -8,7 +8,7 @@ interface ResultsTableProps {
 }
 
 export default function ResultsTable({ jobId }: ResultsTableProps) {
-    const [data, setData] = useState<any[]>([]);
+    const [data, setData] = useState<Record<string, unknown>[]>([]);
     const [currentPage, setCurrentPage] = useState(1);
     const [totalPages, setTotalPages] = useState(1);
     const [isLoading, setIsLoading] = useState(false);
@@ -93,7 +93,7 @@ export default function ResultsTable({ jobId }: ResultsTableProps) {
                                                     REDACTED
                                                 </span>
                                             ) : (
-                                                row[header]
+                                                String(row[header] ?? "")
                                             )}
                                         </td>
                                     ))}

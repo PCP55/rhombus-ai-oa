@@ -1,7 +1,10 @@
 import React from "react";
 
+import type { JobResultData } from "../lib/api";
+
 // 1. The Interface Contract
 interface ExtractionFormProps {
+    columns: string[];
     targetColumn: string;
     setTargetColumn: (val: string) => void;
     prompt: string;
@@ -12,7 +15,7 @@ interface ExtractionFormProps {
     // Tracking Props
     jobStatus: string;
     progress: number;
-    resultData: any;
+    resultData: JobResultData | null;
     errorMessage: string;
 
     // Actions
@@ -21,6 +24,7 @@ interface ExtractionFormProps {
 }
 
 export default function ExtractionForm({
+    columns,
     targetColumn,
     setTargetColumn,
     prompt,
@@ -34,29 +38,39 @@ export default function ExtractionForm({
     onSubmit,
     onCancel,
 }: ExtractionFormProps) {
-
-    // Helper variable to determine if the UI should be locked down
-    const isRunning =
-        jobStatus === "QUEUED" ||
-        jobStatus === "RUNNING" ||
-        jobStatus === "SUBMITTING";
+    // Locks the whole form down while a file is being inspected or a job is
+    // being submitted/queued/run — none of these are safe moments to edit inputs.
+    const isBusy = ["INSPECTING", "SUBMITTING", "QUEUED", "RUNNING"].includes(
+        jobStatus,
+    );
+    // Only QUEUED/RUNNING jobs actually exist in Celery and can be cancelled.
+    const isActive = ["QUEUED", "RUNNING"].includes(jobStatus);
+    const hasColumns = columns.length > 0;
 
     return (
         <div className="space-y-6 mt-6">
-
             {/* --- User Input Section --- */}
             <div>
                 <label className="block text-sm font-medium text-gray-700 mb-1">
                     Target Column
                 </label>
-                <input
-                    type="text"
+                <select
                     value={targetColumn}
                     onChange={(e) => setTargetColumn(e.target.value)}
-                    disabled={isRunning}
-                    placeholder="e.g., Email"
+                    disabled={isBusy || !hasColumns}
                     className="w-full px-4 py-2 bg-gray-50 border border-gray-200 rounded-lg text-gray-900 disabled:opacity-50"
-                />
+                >
+                    <option value="" disabled>
+                        {hasColumns
+                            ? "Select a column…"
+                            : "Upload a file to see its columns"}
+                    </option>
+                    {columns.map((column) => (
+                        <option key={column} value={column}>
+                            {column}
+                        </option>
+                    ))}
+                </select>
             </div>
 
             <div>
@@ -67,7 +81,7 @@ export default function ExtractionForm({
                     rows={3}
                     value={prompt}
                     onChange={(e) => setPrompt(e.target.value)}
-                    disabled={isRunning}
+                    disabled={isBusy}
                     placeholder="e.g., Find email addresses in the Email column and replace them with 'REDACTED'"
                     className="w-full px-4 py-2 bg-gray-50 border border-gray-200 rounded-lg text-gray-900 disabled:opacity-50"
                 />
@@ -81,7 +95,7 @@ export default function ExtractionForm({
                     type="text"
                     value={replacement}
                     onChange={(e) => setReplacement(e.target.value)}
-                    disabled={isRunning}
+                    disabled={isBusy}
                     placeholder="e.g., [REDACTED] or leave blank to delete"
                     className="w-full px-4 py-2 bg-gray-50 border border-gray-200 rounded-lg text-gray-900 disabled:opacity-50"
                 />
@@ -89,21 +103,24 @@ export default function ExtractionForm({
 
             {/* --- Dynamic Tracking UI Section --- */}
             <div className="mt-8 space-y-4">
-
                 {/* The Action Buttons */}
                 <div className="flex gap-4">
                     <button
                         type="button"
                         onClick={onSubmit}
-                        disabled={isRunning}
+                        disabled={isBusy || !hasColumns}
                         className={`flex-1 font-medium py-3 rounded-lg text-white transition-colors
-                            ${isRunning ? "bg-gray-400 cursor-not-allowed" : "bg-gray-900 hover:bg-gray-800"}`}
+                            ${isBusy || !hasColumns ? "bg-gray-400 cursor-not-allowed" : "bg-gray-900 hover:bg-gray-800"}`}
                     >
-                        {isRunning ? "Processing Data..." : "Process Data"}
+                        {jobStatus === "SUBMITTING"
+                            ? "Submitting..."
+                            : isActive
+                              ? "Processing Data..."
+                              : "Process Data"}
                     </button>
 
                     {/* Only show Cancel button if actively processing */}
-                    {isRunning && (
+                    {isActive && (
                         <button
                             type="button"
                             onClick={onCancel}
@@ -114,8 +131,8 @@ export default function ExtractionForm({
                     )}
                 </div>
 
-                {/* The Progress Bar (Only visible when running) */}
-                {isRunning && (
+                {/* The Progress Bar (Only visible once a job is actually queued/running) */}
+                {isActive && (
                     <div className="w-full bg-gray-100 rounded-full h-2.5 overflow-hidden">
                         <div
                             className="bg-blue-600 h-2.5 transition-all duration-500 ease-out"

@@ -10,7 +10,7 @@ services:
             context: ./backend
             dockerfile: Dockerfile
         image: my-django-app:latest
-        command: python manage.py runserver 0.0.0.0:8000
+        command: sh -c "python manage.py migrate --noinput && python manage.py runserver 0.0.0.0:8000"
         volumes:
             - ./backend:/app
         ports:
@@ -27,6 +27,7 @@ services:
             - DJANGO_CSRF_TRUSTED_ORIGINS=${DJANGO_CSRF_TRUSTED_ORIGINS:-}
             - DJANGO_BEHIND_HTTPS_PROXY=${DJANGO_BEHIND_HTTPS_PROXY:-False}
             - APP_ACCESS_KEY=${APP_ACCESS_KEY:-}
+            - MAX_UPLOAD_SIZE_MB=${MAX_UPLOAD_SIZE_MB:-200}
 
     # 3. The Background Task Worker (Celery)
     worker:
@@ -46,6 +47,7 @@ services:
             - DJANGO_SECRET_KEY=${DJANGO_SECRET_KEY:-}
             - DJANGO_DEBUG=${DJANGO_DEBUG:-True}
             - DJANGO_ALLOWED_HOSTS=${DJANGO_ALLOWED_HOSTS:-localhost,127.0.0.1}
+            - GOOGLE_API_KEY=${GOOGLE_API_KEY:-}
 
     # 4. The Spark Master
     spark:
