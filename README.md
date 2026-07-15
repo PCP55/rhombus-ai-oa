@@ -7,6 +7,11 @@ and the actual find-and-replace runs as a distributed PySpark job on a
 Celery worker — so the web server stays responsive even on multi-million-row
 files.
 
+**Current status:** End-to-end pipeline is working on a DigitalOcean Droplet
+(bare IP, no TLS yet). Two-step upload → column dropdown → async processing
+with live progress is implemented. Large-file testing is in progress
+(~1.2 GB CSV). Demo video still to be recorded.
+
 ## Demo Video
 
 *Recording in progress — will be embedded here.* The video will walk through
@@ -16,6 +21,7 @@ progress live, and viewing the paginated processed output.
 ## Contents
 
 - [Architecture](#architecture)
+- [API endpoints](#api-endpoints)
 - [Repository layout](#repository-layout)
 - [Setup & run (Docker Compose)](#setup--run-docker-compose)
 - [Using the app](#using-the-app)
@@ -31,9 +37,9 @@ progress live, and viewing the paginated processed output.
 ```
                     ┌─────────────┐
    Browser  ─────▶  │  Next.js    │  (frontend/, port 3000)
-                    │  frontend   │
+   Basic Auth        │  frontend   │  upload progress via XHR
                     └──────┬──────┘
-                           │ fetch() + X-Access-Key
+                           │ fetch() / XHR + X-Access-Key
                            ▼
                     ┌─────────────┐          ┌───────────────┐
                     │   Django    │  ───────▶│     Redis     │
@@ -56,26 +62,66 @@ progress live, and viewing the paginated processed output.
                                              └───────────────────┘
 ```
 
-**Why this stack:**
+### Request flow (two-step upload)
+
+Large files are only transferred once. The UI splits the work into two API
+calls so column discovery doesn't require a second upload:
+
+```
+1. POST /api/upload/     → store file, read header row, return column names
+                           (ProcessingJob status: DRAFT)
+2. POST /api/submit/     → attach column + NL prompt + replacement, queue Celery
+                           (status: DRAFT → QUEUED → RUNNING → SUCCESS/FAILED)
+3. GET  /api/status/     → poll every 2s for progress + result
+4. GET  /api/results/    → paginated processed rows (once SUCCESS)
+```
+
+### Why this stack
 
 - **Django** owns the API, the `ProcessingJob` model (status/progress
-  persistence), and URL routing. It is intentionally thin — it only ever
-  creates a job row and hands off to Celery; it never touches the uploaded
-  file's contents itself.
+  persistence), and URL routing. It is intentionally thin — it creates job
+  rows and hands off to Celery; it never runs Spark or LLM calls inline.
+  The one synchronous file touch is reading a single header line for the
+  column dropdown (`services/columns.py`).
 - **Celery + Redis** decouple the request/response cycle from the actual
-  work. `upload_file()` returns a `job_id` in milliseconds; all parsing,
-  LLM calls, and Spark orchestration happen later, in a worker process.
-  Redis plays two independent roles here — message broker/result backend
-  for Celery, and a cache for LLM-generated regex patterns — see
-  [below](#asynchronous-processing-celery--redis) for why that's safe to
-  share on one Redis instance.
-- **PySpark** is the actual transformation engine. `regexp_replace` runs as
-  a column expression across partitions, not a Python loop over rows, so
-  the same code path that works for a 100-row CSV also works for a
-  10-million-row one — only the number of partitions and runtime change.
-- **Next.js** polls the status endpoint every 2s and renders a progress bar
-  driven by the same `progress` value the worker is writing, then swaps to
-  a paginated results table once the job succeeds.
+  work. `submit_job()` returns a `job_id` in milliseconds; all parsing,
+  LLM calls, and Spark orchestration happen later in a worker process.
+  Redis plays two independent roles — message broker/result backend for
+  Celery (db 0), and a cache for LLM-generated regex patterns (db 1) — on
+  the same Redis container with separate logical databases.
+- **PySpark** is the transformation engine. `regexp_replace` runs as a column
+  expression across partitions, not a Python loop over rows, so the same code
+  path that works for a 100-row CSV also works for a 10-million-row one.
+- **Next.js** shows upload progress (XHR), polls job status every 2s, renders
+  a progress bar driven by `job.progress`, and swaps to a paginated results
+  table once the job succeeds.
+
+### Middleware & security layers (Django)
+
+Middleware order matters — `CorsMiddleware` is listed first so every
+response (including short-circuited 401/413 errors) gets CORS headers:
+
+| Middleware | Role |
+|------------|------|
+| `CorsMiddleware` | CORS headers on all responses (must be outermost) |
+| `MaxUploadSizeMiddleware` | Rejects oversized `Content-Length` with 413 |
+| `RequireAccessKeyMiddleware` | `X-Access-Key` gate via `hmac.compare_digest` |
+
+The frontend adds a second gate: HTTP Basic Auth on the Next.js site itself
+(`frontend/middleware.ts`). See [Deployment notes](#deployment-notes).
+
+## API endpoints
+
+| Method | Path | Purpose |
+|--------|------|---------|
+| `POST` | `/api/upload/` | Stage file, return `job_id` + `columns` (DRAFT) |
+| `POST` | `/api/submit/<job_id>/` | Attach inputs, queue Celery (→ QUEUED) |
+| `GET` | `/api/status/<job_id>/` | Poll status, progress, result/error |
+| `POST` | `/api/cancel/<job_id>/` | Cancel running job or discard DRAFT |
+| `GET` | `/api/results/<job_id>/` | Paginated processed rows (`?page=&limit=`) |
+
+All `POST` endpoints are `@csrf_exempt` because the API is stateless (no
+session cookie) and authorized via `X-Access-Key` + CORS instead.
 
 ## Repository layout
 
@@ -83,24 +129,25 @@ progress live, and viewing the paginated processed output.
 rhombus-ai-oa/
 ├── backend/                      # Django project
 │   ├── api/
-│   │   ├── models.py             # ProcessingJob (status, progress, inputs, result)
-│   │   ├── views.py              # upload / status / cancel / paginated results
-│   │   ├── tasks.py              # the one Celery task that does all the work
-│   │   ├── middleware.py         # RequireAccessKeyMiddleware (shared-secret gate)
+│   │   ├── models.py             # ProcessingJob (DRAFT/QUEUED/RUNNING/…)
+│   │   ├── views.py              # upload / submit / status / cancel / results
+│   │   ├── tasks.py              # Celery task: LLM → Spark → save result
+│   │   ├── middleware.py         # access-key gate + upload size cap
 │   │   └── services/
-│   │       ├── llm.py            # NL -> regex via Gemini, + safety validation
-│   │       └── spark.py          # the actual Spark transformation + chunked write
+│   │       ├── columns.py        # read header row only (CSV/Excel)
+│   │       ├── llm.py            # NL → regex via Gemini + ReDoS guard
+│   │       └── spark.py          # Spark transformation + chunked write
 │   ├── core/                     # settings.py, urls.py, celery.py
 │   └── Dockerfile
 ├── frontend/                      # Next.js app
-│   ├── app/page.tsx               # top-level form + polling state machine
+│   ├── app/page.tsx               # upload + form + polling state machine
 │   ├── components/                # FileDropzone, ExtractionForm, ResultsTable
-│   ├── lib/api.ts                 # apiFetch() — base URL + access-key header
-│   ├── middleware.ts              # HTTP Basic Auth gate on the whole site
+│   ├── lib/api.ts                 # apiFetch + apiUploadWithProgress (XHR)
+│   ├── middleware.ts              # HTTP Basic Auth gate
 │   └── Dockerfile
 ├── docker-compose.yaml            # redis, web, worker, spark, spark-worker, frontend
-├── .env.example                   # root-level config (Django, access gate, frontend)
-└── backend/.env.example           # backend-only config (GOOGLE_API_KEY, local dev)
+├── .env.example                   # root config (Django, access gate, frontend)
+└── backend/.env.example           # backend-only (GOOGLE_API_KEY, local dev)
 ```
 
 ## Setup & run (Docker Compose)
@@ -108,289 +155,240 @@ rhombus-ai-oa/
 **Prerequisites:** Docker + Docker Compose, and a Google Gemini API key
 (the LLM step uses `langchain-google-genai`).
 
-1. **Configure environment variables.** There are two separate `.env` files
-   because of how they're consumed:
+### 1. Configure environment variables
 
-   - `.env` (repo root) — copy from `.env.example`. Read by
-     `docker-compose.yaml`'s `environment:` blocks (Django security
-     settings, the access-gate key, frontend build args).
-   - `backend/.env` — copy from `backend/.env.example`. The `web` and
-     `worker` services bind-mount the whole `backend/` folder into the
-     container, so this file lands at `/app/.env` inside them and is picked
-     up automatically by `python-dotenv`'s `load_dotenv()` in
-     `core/settings.py`. **`GOOGLE_API_KEY` must go here**, not in the root
-     `.env` — there's no explicit passthrough for it in
-     `docker-compose.yaml`.
+There are two separate `.env` files because of how they're consumed:
 
-   ```bash
-   cp .env.example .env
-   cp backend/.env.example backend/.env
-   # edit backend/.env and set GOOGLE_API_KEY=<your Gemini key>
-   ```
+| File | Used by | Purpose |
+|------|---------|---------|
+| `.env` (repo root) | `docker-compose.yaml` | Django security, access gate, frontend build args, `MAX_UPLOAD_SIZE_MB` |
+| `backend/.env` | `load_dotenv()` in `settings.py` | `GOOGLE_API_KEY` for local/non-Compose runs |
 
-   For a first local run, the defaults in `.env.example`/`backend/.env.example`
-   (`DJANGO_DEBUG=True`, no access key) are enough — you only need to fill
-   in real values for [deployment](#deployment-notes).
+```bash
+cp .env.example .env
+cp backend/.env.example backend/.env
+# edit backend/.env and set GOOGLE_API_KEY=<your Gemini key>
+```
 
-2. **Bring the whole stack up with one command:**
+For local dev, the defaults (`DJANGO_DEBUG=True`, no access key) are enough.
+For deployment, see [Deployment notes](#deployment-notes).
 
-   ```bash
-   docker compose up --build
-   # or: make build
-   ```
+**Large files:** bump `MAX_UPLOAD_SIZE_MB` in the root `.env` (default 200).
+A 1.2 GB file needs at least `MAX_UPLOAD_SIZE_MB=2048`, and the droplet needs
+~3 GB free disk (Django spools to temp, then copies to `media/`).
 
-   This starts, in order of dependency: `redis`, `web` (Django on `:8000`),
-   `worker` (Celery), `spark` (master) + `spark-worker`, and `frontend`
-   (Next.js on `:3000`).
+### 2. Start the stack
 
-3. **Apply database migrations** (first run only, in a second terminal):
+```bash
+docker compose up --build
+```
 
-   ```bash
-   docker compose exec web python manage.py migrate
-   ```
+This starts: `redis`, `web` (Django `:8000`), `worker` (Celery),
+`spark` + `spark-worker`, and `frontend` (Next.js `:3000`).
 
-4. Open **http://localhost:3000**.
+The `web` service runs `python manage.py migrate --noinput` on every
+startup, so database migrations apply automatically — no manual migrate step
+needed after the first `docker compose up`.
 
-To run the backend directly on the host instead (e.g. for faster
-iteration), see `backend/Makefile` (`make db-migrate`, etc.) — you'll need
-`uv`, a local Redis, and a local Spark master, so Docker Compose is the
-easier path.
+### 3. Open the app
+
+**http://localhost:3000**
+
+To run the backend directly on the host instead (faster iteration), see
+`backend/Makefile` — you'll need `uv`, local Redis, and Spark, so Docker
+Compose is the easier path.
 
 ## Using the app
 
-1. Drop a `.csv`, `.xls`, or `.xlsx` file onto the upload area. It's
-   uploaded immediately and its real column names come back for a
-   **dropdown** — no need to remember/retype a column name.
-2. Pick the target column from that dropdown, describe the pattern in plain
-   English (e.g. *"Find email addresses and replace them with 'REDACTED'"*),
-   and enter the replacement value.
-3. Submit — you immediately get a live progress bar (the file itself was
-   already uploaded in step 1, so this step is instant).
-4. Once the job succeeds, a paginated table of the processed data appears.
-   You can cancel a running job at any time from the same screen.
+### Job state machine (frontend)
 
-Under the hood this is two API calls, not one, specifically so a large file
-is only ever transferred to the server once:
+```
+"" → INSPECTING → DRAFT → SUBMITTING → QUEUED → RUNNING → SUCCESS/FAILED
+```
 
-- `POST /api/upload/` — stores the file, creates a `ProcessingJob` in
-  `DRAFT` status, and returns its column names (`services/columns.py` reads
-  just the header row — the first physical line for CSV, no dependency on
-  Polars scanning/inferring the rest of the file).
-- `POST /api/submit/<job_id>/` — attaches the column/prompt/replacement the
-  user picked to that same `DRAFT` job and is the point where it actually
-  transitions to `QUEUED` and gets handed to Celery.
+- **INSPECTING** — file is uploading (XHR progress bar) and/or server is
+  reading the header row.
+- **DRAFT** — file is on the server, column dropdown is populated; user
+  fills in the form.
+- **QUEUED / RUNNING** — Celery worker is processing; progress bar polls
+  `/api/status/` every 2s.
+- **SUCCESS / FAILED** — terminal states; results table or error message.
+
+### Steps
+
+1. Drop a `.csv`, `.xls`, or `.xlsx` file. Upload progress is shown in real
+   time (percent + bar). Column names come back for a **dropdown**.
+2. Pick the target column, describe the pattern in plain English, and enter
+   the replacement value.
+3. Submit — the file was already uploaded in step 1, so this is instant.
+   A live progress bar tracks Celery/Spark processing.
+4. Once the job succeeds, a paginated table of processed data appears.
+   Cancel a running job at any time.
+
+### Validation
+
+- **File extension** — only `.csv`, `.xls`, `.xlsx` accepted (`views.py`).
+- **Target column** — server-side allowlist against columns read at upload
+  time (`ProcessingJob.columns` JSONField); the dropdown is a UX convenience,
+  not the security boundary.
+- **Regex** — LLM output is syntax-checked and ReDoS-probed before Spark
+  sees it (`services/llm.py`).
 
 ## Asynchronous processing: Celery + Redis
 
-**Broker & result backend.** Both are the same Redis instance, logical
-database `0`, configured in `backend/core/settings.py`:
+**Broker & result backend.** Both use Redis logical database `0`:
 
 ```python
 CELERY_BROKER_URL = os.environ.get("CELERY_BROKER_URL", "redis://localhost:6379/0")
 CELERY_RESULT_BACKEND = os.environ.get("CELERY_RESULT_BACKEND", "redis://localhost:6379/0")
 ```
 
-The LLM-regex **cache** deliberately uses a *different* logical database
-(`redis://redis:6379/1`, via `django-redis` in `CACHES`) on the same Redis
-container. Same process, same container, zero extra infrastructure — but a
-cache flush (`cache.clear()`) can never wipe out in-flight Celery task
-state, and vice versa.
+The LLM-regex **cache** uses logical database `1` (`django-redis` in
+`CACHES`). Same Redis container, zero extra infrastructure — but a cache
+flush can never wipe in-flight Celery task state.
 
 **The one Celery task.** `process_file_task` (`backend/api/tasks.py`) does
-everything the web process is not allowed to do inline: it looks up the
-`ProcessingJob`, resolves the regex (cache-or-LLM), converts Excel to CSV
-via Polars if needed, and calls into `process_data_with_spark`. The web
-process's only job is creating/updating the `ProcessingJob` row and, once
-the user has picked a column and described the pattern (see
-[Using the app](#using-the-app)), calling `process_file_task.apply_async(...)`
-— reading the header row for the column dropdown in `upload_file()` is the
-one synchronous file touch the web process does, and it's bounded to a
-single line, never the whole file.
+everything the web process cannot do inline: resolve the regex (cache-or-LLM),
+convert Excel to CSV via Polars if needed, and call `process_data_with_spark`.
+Logging uses Python's `logging` module (not `print`) with a `LOGGING` config
+in `settings.py` so `INFO`-level messages appear in `docker compose logs`.
 
 **Progress reporting.** The Celery task ID is pinned to the job's UUID
-(`apply_async(args=[job.id], task_id=str(job.id))` in `views.py`) so the
-polling endpoint can look up that exact task's live state later via
-`AsyncResult(str(job.id))`. Progress moves through three bands:
+(`apply_async(args=[job.id], task_id=str(job.id))`) so the polling endpoint
+can look up live state via `AsyncResult(str(job.id))`:
 
-| Stage                          | `job.progress` |
-|---------------------------------|-----------------|
-| Job picked up by a worker       | 10% |
-| Regex resolved (cache or LLM)   | 30% |
-| Spark rows processed            | 50% → 95%, scaled to `rows_processed / total_rows` |
-| Job complete                    | 100% |
+| Stage | `job.progress` |
+|-------|-----------------|
+| Job picked up by worker | 10% |
+| Regex resolved (cache or LLM) | 30% |
+| Spark rows processed | 50% → 95%, scaled to `rows_processed / total_rows` |
+| Job complete | 100% |
 
 Row-level progress comes from `services/spark.py`: the DataFrame is
-repartitioned into `NUM_PROGRESS_CHUNKS` (10) pieces, each chunk is written
-separately, and a `progress_callback(rows_processed, total_rows)` fires
-after every chunk. The Celery task turns that into both a `job.progress`
-database write (for the simple `progress` field the UI already polls) and a
-richer `self.update_state(..., meta={...})` call, which `check_status()`
-surfaces as `progress_detail` while the job is `RUNNING` — so the frontend
-could show "Processed 420,000/1,000,000 rows (42%)" if it wants finer detail
-than the plain percentage.
+repartitioned into `NUM_PROGRESS_CHUNKS` (10) pieces, each written
+separately, and a `progress_callback` fires after every chunk. The Celery
+task writes both `job.progress` (DB) and `self.update_state(..., meta={...})`
+(Celery), which `check_status()` surfaces as `progress_detail` while
+`RUNNING`.
 
 **Failure, retries, cancellation.**
-- `@shared_task(bind=True, autoretry_for=(Exception,), retry_backoff=True, max_retries=3)`
-  retries on failure with exponential backoff. We deliberately kept this
-  broad (any `Exception`) rather than narrowing it to transient errors —
-  see [trade-offs](#trade-offs--known-limitations) for the reasoning.
-- Cancellation (`cancel_job` view) calls
-  `current_app.control.revoke(task_id, terminate=True, signal="SIGKILL")`,
-  which kills the worker process outright (needed because a Spark job stuck
-  in the JVM won't respond to a polite Celery revoke) and marks the job
-  `FAILED` with an explanatory message.
+- `autoretry_for=(Exception,)` with exponential backoff and `max_retries=3`.
+  Broad by design — see [trade-offs](#trade-offs--known-limitations).
+- Cancellation calls `revoke(task_id, terminate=True, signal="SIGKILL")` to
+  kill a stuck Spark/JVM process, then marks the job `FAILED`.
 
 ## Distributed processing: PySpark
 
 `services/spark.py` reads the CSV with `spark.read.csv(...)`, applies
-`regexp_replace` as a **column expression** via `withColumn` — this runs
-inside Spark's Catalyst engine across however many partitions the
-DataFrame has, not as a Python `for` loop over collected rows — and writes
-the result back out as Parquet.
+`regexp_replace` as a column expression via `withColumn`, and writes the
+result as Parquet chunks.
 
-**Partitioning choice.** After counting rows once (`df.count()`, needed
-anyway for progress reporting), the transformed DataFrame is explicitly
-repartitioned to `NUM_PROGRESS_CHUNKS = 10` partitions
-(`min(10, max(1, total_rows))` so tiny files don't get split into
-mostly-empty partitions). Each partition is written as its own Parquet
-chunk (`spark_partition_id() == chunk_id`, first chunk `overwrite`, the
-rest `append`), and a progress callback fires after each one. This is a
-deliberate trade-off: **10 fixed chunks keep progress reporting predictable
-regardless of file size** (roughly even 10%-of-rows increments), at the
-cost of not auto-tuning partition count to cluster resources the way you
-would in a general-purpose Spark job. For genuinely large inputs (millions
-of rows) this still parallelizes real work across `spark.cores.max`
-executor cores — the constant only controls how many *write actions* and
-progress updates happen, not how much data any one task holds in memory at
-once, since each write is itself still a distributed Spark write over that
-partition's rows.
+**Partitioning choice.** After `df.count()` (needed for progress), the
+transformed DataFrame is repartitioned to `NUM_PROGRESS_CHUNKS = 10`
+(`min(10, max(1, total_rows))`). Each partition is written separately with
+a progress callback. This keeps progress reporting predictable regardless of
+file size, at the cost of not auto-tuning partition count to cluster resources.
 
-Reading back for the UI (`get_paginated_results` in `views.py`) uses
-`polars.scan_parquet(...)` — a **lazy** scan over the whole chunked output
-directory — then `.slice(offset, limit).collect()` to materialize only the
-one page actually requested. This is what keeps "millions of rows" from
-ever hitting the browser: the full result set lives on disk as Parquet,
-and only ~50 rows at a time are ever loaded into memory or serialized to
-JSON.
+Reading back for the UI (`get_paginated_results`) uses `polars.scan_parquet(...)`
+— a lazy scan — then `.slice(offset, limit).collect()` for only the requested
+page. The full result set lives on disk; only ~50 rows at a time hit the browser.
 
-Spark itself runs as two extra Compose services (`spark`, `spark-worker`),
-each memory-capped (512M / 1G) and resource-limited via `spark.cores.max`
-in the session config, so a single job can't starve the rest of the stack
-on a small Droplet.
+Spark runs as two Compose services (`spark`, `spark-worker`), memory-capped
+(512M / 1G) with `spark.cores.max = 1`, so a single job can't starve the rest
+of the stack on a small Droplet.
 
 ## LLM integration & regex safety
 
-`services/llm.py` uses `langchain-google-genai` (Gemini) with a small
-few-shot prompt to turn a natural-language description into a raw regex
-string. That output is never trusted as-is — `validate_regex()` runs two
-checks before it's cached or handed to Spark:
+`services/llm.py` uses `langchain-google-genai` (Gemini) with a few-shot
+prompt to turn natural language into a regex string. `validate_regex()` runs
+two checks before caching or handing to Spark:
 
-1. **Syntax validity** — `re.compile(pattern)`; a `re.error` is turned into
-   a descriptive `ValueError` that surfaces as the job's `error_message`.
-2. **Catastrophic-backtracking (ReDoS) guard** — the compiled pattern is run
-   against a handful of adversarial probe strings (long repeated
-   characters, deliberately-non-matching suffixes — the classic shapes that
-   blow up patterns like `(a+)+$` or `([a-zA-Z]+)*$`), each under a
-   500ms wall-clock timeout (`SIGALRM`-based). If any probe doesn't resolve
-   in time, the pattern is rejected outright instead of ever reaching
-   Spark, where it would otherwise be free to peg a CPU core indefinitely
-   against real user data. **Caveat:** this validates against Python's `re`
-   engine; the actual replacement runs on Spark's JVM regex engine
-   (`java.util.regex`), which can behave differently in edge cases for the
-   same pattern. This guard meaningfully reduces risk but isn't a
-   byte-for-byte guarantee of Spark-side safety — a production system would
-   add a matching JVM-side probe.
+1. **Syntax validity** — `re.compile(pattern)`; `re.error` surfaces as the
+   job's `error_message`.
+2. **ReDoS guard** — adversarial probe strings (120 chars each) run under a
+   500ms `SIGALRM` timeout. Patterns that don't resolve in time are rejected.
+   **Caveat:** this validates Python's `re` engine; Spark runs on the JVM
+   (`java.util.regex`), which can behave differently in edge cases.
 
-Only patterns that pass both checks get cached in Redis
-(`regex_prompt_<normalized prompt>`, 24h TTL) and applied to the data.
+Only patterns passing both checks are cached in Redis (`regex_prompt_<prompt>`,
+24h TTL).
 
 ## Large-file / scale testing
 
-*To be filled in once a sizeable dataset has been run through the pipeline.*
+**In progress.** A ~1.2 GB CSV is being tested against the live Droplet
+deployment. Key configuration for large uploads:
 
-Planned methodology:
+| Setting | Default | Notes |
+|---------|---------|-------|
+| `MAX_UPLOAD_SIZE_MB` | 200 | Set to 2048+ for multi-GB files |
+| `FILE_UPLOAD_TEMP_DIR` | `media/.upload-tmp` | Spools large uploads to the mounted volume, not container `/tmp` |
+| Disk space | — | Need ~3× file size free briefly (temp + final copy) |
 
-1. Generate or source a CSV in the multi-million-row range (a synthetic
-   dataset of names + emails works well since it exercises the same regex
-   used in the example scenario).
-2. Upload it through the running stack and record: total rows, wall-clock
-   time from `QUEUED` to `SUCCESS`, and the `job.progress` cadence observed
-   while it ran.
-3. Confirm the paginated results endpoint stays fast (single-page fetch
-   time) regardless of total row count, since it never materializes more
-   than one page of Parquet at a time.
+Planned methodology once the 1.2 GB run completes:
+
+1. Record total rows, wall-clock time from `QUEUED` → `SUCCESS`, and
+   `job.progress` cadence during the run.
+2. Confirm paginated results stay fast regardless of total row count.
 
 | Rows | File size | End-to-end time | Notes |
 |------|-----------|------------------|-------|
-| _TBD_ | _TBD_ | _TBD_ | _TBD_ |
+| _TBD_ | ~1.2 GB | _TBD_ | Upload + processing test in progress |
 
 ## Deployment notes
 
-The app is deployed on a bare DigitalOcean Droplet IP (no domain/TLS yet).
-Two independent access controls gate it, since there's no full user-account
-system:
+Deployed on a bare DigitalOcean Droplet IP (no domain/TLS yet). Three
+independent controls gate access:
 
-- **`RequireAccessKeyMiddleware`** (`backend/api/middleware.py`) — every API
-  request must carry `X-Access-Key: <APP_ACCESS_KEY>`, checked with
-  `hmac.compare_digest` (not `!=`) to avoid leaking timing information about
-  how much of the key matched. The frontend attaches it automatically via
-  `lib/api.ts` once `NEXT_PUBLIC_APP_ACCESS_KEY` is set at build time.
-  No-ops entirely if `APP_ACCESS_KEY` is unset.
-- **HTTP Basic Auth** (`frontend/middleware.ts`) — gates the site itself,
-  driven by `BASIC_AUTH_USER` / `BASIC_AUTH_PASSWORD`, read at request time
-  (a plain container restart picks up changes, no rebuild needed).
-- **`MaxUploadSizeMiddleware`** (`backend/api/middleware.py`) — rejects any
-  request whose declared `Content-Length` exceeds `MAX_UPLOAD_SIZE_MB`
-  (default 200MB) with a `413`, before Django reads any of the body. There's
-  no reverse proxy in front of this app to enforce this at a lower layer, so
-  it's done here.
+| Layer | Mechanism | Config |
+|-------|-----------|--------|
+| Site | HTTP Basic Auth | `BASIC_AUTH_USER` / `BASIC_AUTH_PASSWORD` (runtime) |
+| API | `X-Access-Key` header | `APP_ACCESS_KEY` / `NEXT_PUBLIC_APP_ACCESS_KEY` (build-time for frontend) |
+| Upload size | `Content-Length` check | `MAX_UPLOAD_SIZE_MB` (runtime) |
 
-See `.env.example` for the full list of deployment variables and inline
-notes on which are build-time vs. runtime.
+See `.env.example` for the full variable list and build-time vs. runtime notes.
 
 ### Pre-launch checklist
 
-Before sharing the deployed URL with anyone outside the team:
+Before sharing the deployed URL with a grader:
 
-- [ ] `DJANGO_DEBUG=False` (currently intentionally `True` while
-      functionality is being verified end-to-end — verbose error pages leak
-      internals and must not be public).
-- [ ] A real, random `DJANGO_SECRET_KEY` is set (not the `django-insecure-...`
-      dev default).
-- [ ] `APP_ACCESS_KEY` and `BASIC_AUTH_USER`/`BASIC_AUTH_PASSWORD` are set to
-      real values and only shared with the intended reviewer.
-- [ ] Django's `/admin/` either has no superuser created, or a strong
-      password if one exists — it's intentionally exempt from the access-key
-      gate (its own login already protects it), so it's reachable by anyone
-      with the URL.
-- [ ] Understand that without TLS, Basic Auth credentials, the access key,
-      and uploaded file contents all travel in cleartext over plain HTTP —
-      acceptable for a short-lived graded demo on a bare IP, not for
-      anything sensitive or long-lived.
+- [ ] `DJANGO_DEBUG=False` with a real `DJANGO_SECRET_KEY`
+- [ ] `APP_ACCESS_KEY` and `BASIC_AUTH_USER`/`BASIC_AUTH_PASSWORD` set
+- [ ] `MAX_UPLOAD_SIZE_MB` set high enough for your test file
+- [ ] `DJANGO_ALLOWED_HOSTS` and `DJANGO_CORS_ALLOWED_ORIGINS` include the Droplet IP
+- [ ] `NEXT_PUBLIC_API_BASE_URL` points at the API's public URL (rebuild frontend after changing)
+- [ ] Django `/admin/` has no superuser, or a strong password if one exists
+- [ ] Enough disk space on the Droplet for the largest test file (~3× file size)
+- [ ] Understand that without TLS, credentials and file contents travel in cleartext
+
+### Redeploying after code changes
+
+```bash
+git pull
+docker compose up --build -d
+# migrations run automatically on web startup
+# if frontend env vars changed, rebuild frontend:
+docker compose up --build -d frontend
+```
 
 ## Trade-offs & known limitations
 
-- **Single target column.** The rubric's "target column(s)" phrasing allows
-  for multi-column support, but the model, API, and UI here all take a
-  single column name. This was a deliberate scope decision for this
-  submission rather than an oversight — extending `ProcessingJob.target_column`
-  to a comma-separated list and looping the `withColumn` call in
-  `services/spark.py` would be the natural extension if needed.
+- **Single target column.** Model, API, and UI take one column name. Extending
+  to multi-column would mean looping `withColumn` in `services/spark.py`.
 - **Broad retry policy.** `autoretry_for=(Exception,)` retries permanent
-  failures (a malformed upload, a genuinely unsafe regex) exactly as
-  eagerly as transient ones (a Redis blip). We chose not to narrow this for
-  this submission; a follow-up would split out a `PermanentFailure`
-  exception type that bypasses retries entirely.
-- **SQLite for job state.** Fine for a single-Droplet demo; a real
-  multi-worker production deployment would move `ProcessingJob` to Postgres
-  to avoid SQLite's single-writer lock under concurrent job updates.
+  failures (bad upload, unsafe regex) as eagerly as transient ones (Redis
+  blip). A follow-up would introduce a `PermanentFailure` exception type.
+- **SQLite for job state.** Fine for a single-Droplet demo; production would
+  use Postgres to avoid single-writer lock under concurrent updates.
+- **Django dev server.** `runserver` handles uploads synchronously and is not
+  production-grade. Adequate for this assessment; a real deployment would use
+  Gunicorn/Uvicorn behind a reverse proxy with proper upload timeouts.
 - **No automated tests yet** for the Celery task or Spark service layer
-  (`backend/api/tests.py` is currently a stub) — the pipeline has been
-  verified manually end-to-end instead.
-- **Orphaned `DRAFT` jobs.** If a user uploads a file (step 1 above) and
-  then abandons the page without ever submitting or picking a different
-  file, that `DRAFT` row and its uploaded file are never cleaned up. A real
-  deployment would add a periodic task (Celery beat, or a simple cron'd
-  management command) to delete `DRAFT` jobs older than, say, 24 hours, and
-  a per-IP upload rate limit — `MaxUploadSizeMiddleware` caps how big any
-  single request can be, but not how many a client can send.
+  (`backend/api/tests.py` is a stub) — verified manually end-to-end.
+- **Orphaned DRAFT jobs.** Abandoned uploads (user leaves after step 1) are
+  never cleaned up. A periodic cleanup task and per-IP rate limit would be
+  needed for a long-lived deployment.
+- **ReDoS guard is Python-only.** JVM regex behavior in Spark is not probed;
+  see [LLM integration](#llm-integration--regex-safety).
+- **Excel column read loads full file.** `pl.read_excel()` in `columns.py` is
+  synchronous on the web tier. Acceptable because Excel files are not the
+  multi-GB case PySpark is responsible for.
