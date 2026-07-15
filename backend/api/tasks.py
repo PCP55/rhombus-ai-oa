@@ -11,12 +11,7 @@ from .services.spark import process_data_with_spark
 logger = logging.getLogger(__name__)
 
 
-@shared_task(
-    bind=True,
-    autoretry_for=(Exception,),  # Retry if ANY exception occurs
-    retry_backoff=True,
-    max_retries=3,
-)
+@shared_task(bind=True)
 def process_file_task(self, job_id):
     """
     This runs completely in the background via Celery and Redis.

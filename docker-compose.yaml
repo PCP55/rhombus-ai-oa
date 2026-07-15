@@ -47,6 +47,7 @@ services:
             - DJANGO_SECRET_KEY=${DJANGO_SECRET_KEY:-}
             - DJANGO_DEBUG=${DJANGO_DEBUG:-True}
             - DJANGO_ALLOWED_HOSTS=${DJANGO_ALLOWED_HOSTS:-localhost,127.0.0.1}
+            - GOOGLE_API_KEY=${GOOGLE_API_KEY:-}
 
     # 4. The Spark Master
     spark:

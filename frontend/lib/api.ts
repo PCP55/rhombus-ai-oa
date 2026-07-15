@@ -20,10 +20,25 @@ export function apiFetch(path: string, init: RequestInit = {}) {
     return fetch(`${API_BASE_URL}${path}`, { ...init, headers });
 }
 
-export interface UploadResult {
+/** JSON shape returned by POST /api/upload/ */
+export interface UploadResponse {
+    job_id: string;
+    status: string;
+    columns: string[];
+    error?: string;
+}
+
+/** Preview metadata stored on a completed job */
+export interface JobResultData {
+    message: string;
+    regex_used: string;
+    preview: Record<string, unknown>[];
+}
+
+export interface UploadResult<T = UploadResponse | null> {
     ok: boolean;
     status: number;
-    data: any;
+    data: T;
     // Raw response body, kept around so callers can surface *something*
     // useful (status code, a snippet of an HTML error page, etc.) when the
     // response wasn't valid JSON -- e.g. a proxy/gateway timeout page, or a
@@ -60,7 +75,7 @@ export function apiUploadWithProgress(
         };
 
         xhr.onload = () => {
-            let data: any = null;
+            let data: UploadResponse | null = null;
             try {
                 data = xhr.responseText ? JSON.parse(xhr.responseText) : null;
             } catch {

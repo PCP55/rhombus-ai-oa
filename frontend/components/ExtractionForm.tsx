@@ -1,5 +1,7 @@
 import React from "react";
 
+import type { JobResultData } from "../lib/api";
+
 // 1. The Interface Contract
 interface ExtractionFormProps {
     columns: string[];
@@ -13,7 +15,7 @@ interface ExtractionFormProps {
     // Tracking Props
     jobStatus: string;
     progress: number;
-    resultData: any;
+    resultData: JobResultData | null;
     errorMessage: string;
 
     // Actions

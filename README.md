@@ -82,7 +82,7 @@ calls so column discovery doesn't require a second upload:
   persistence), and URL routing. It is intentionally thin — it creates job
   rows and hands off to Celery; it never runs Spark or LLM calls inline.
   The one synchronous file touch is reading a single header line for the
-  column dropdown (`services/columns.py`).
+  column dropdown (`services/read_columns.py`).
 - **Celery + Redis** decouple the request/response cycle from the actual
   work. `submit_job()` returns a `job_id` in milliseconds; all parsing,
   LLM calls, and Spark orchestration happen later in a worker process.
@@ -134,7 +134,7 @@ rhombus-ai-oa/
 │   │   ├── tasks.py              # Celery task: LLM → Spark → save result
 │   │   ├── middleware.py         # access-key gate + upload size cap
 │   │   └── services/
-│   │       ├── columns.py        # read header row only (CSV/Excel)
+│   │       ├── read_columns.py   # read header row only (CSV/Excel)
 │   │       ├── llm.py            # NL → regex via Gemini + ReDoS guard
 │   │       └── spark.py          # Spark transformation + chunked write
 │   ├── core/                     # settings.py, urls.py, celery.py
@@ -271,9 +271,10 @@ task writes both `job.progress` (DB) and `self.update_state(..., meta={...})`
 (Celery), which `check_status()` surfaces as `progress_detail` while
 `RUNNING`.
 
-**Failure, retries, cancellation.**
-- `autoretry_for=(Exception,)` with exponential backoff and `max_retries=3`.
-  Broad by design — see [trade-offs](#trade-offs--known-limitations).
+**Failure and cancellation.**
+- Failures are recorded on the job row and surfaced via `/api/status/` — the
+  task does not auto-retry (avoids re-running Spark on permanent errors like
+  bad regex or missing files).
 - Cancellation calls `revoke(task_id, terminate=True, signal="SIGKILL")` to
   kill a stuck Spark/JVM process, then marks the job `FAILED`.
 
@@ -374,21 +375,22 @@ docker compose up --build -d frontend
 
 - **Single target column.** Model, API, and UI take one column name. Extending
   to multi-column would mean looping `withColumn` in `services/spark.py`.
-- **Broad retry policy.** `autoretry_for=(Exception,)` retries permanent
-  failures (bad upload, unsafe regex) as eagerly as transient ones (Redis
-  blip). A follow-up would introduce a `PermanentFailure` exception type.
+- **No Celery auto-retry.** Failed jobs are marked `FAILED` once rather than
+  retried — simpler for a demo deployment; production would retry only
+  transient errors (Redis blips, Spark timeouts).
 - **SQLite for job state.** Fine for a single-Droplet demo; production would
   use Postgres to avoid single-writer lock under concurrent updates.
 - **Django dev server.** `runserver` handles uploads synchronously and is not
   production-grade. Adequate for this assessment; a real deployment would use
   Gunicorn/Uvicorn behind a reverse proxy with proper upload timeouts.
 - **No automated tests yet** for the Celery task or Spark service layer
-  (`backend/api/tests.py` is a stub) — verified manually end-to-end.
+  (`backend/api/tests.py` covers regex validation and column reading) —
+  verified manually end-to-end.
 - **Orphaned DRAFT jobs.** Abandoned uploads (user leaves after step 1) are
   never cleaned up. A periodic cleanup task and per-IP rate limit would be
   needed for a long-lived deployment.
 - **ReDoS guard is Python-only.** JVM regex behavior in Spark is not probed;
   see [LLM integration](#llm-integration--regex-safety).
-- **Excel column read loads full file.** `pl.read_excel()` in `columns.py` is
+- **Excel column read loads full file.** `pl.read_excel()` in `read_columns.py` is
   synchronous on the web tier. Acceptable because Excel files are not the
   multi-GB case PySpark is responsible for.

@@ -5,7 +5,12 @@ import ExtractionForm from "../components/ExtractionForm";
 import FileDropzone from "../components/FileDropzone";
 
 import ResultsTable from "../components/ResultsTable";
-import { apiFetch, apiUploadWithProgress, formatUploadError } from "../lib/api";
+import {
+    apiFetch,
+    apiUploadWithProgress,
+    formatUploadError,
+    type JobResultData,
+} from "../lib/api";
 
 export default function Home() {
     // 1. Form Input State
@@ -20,7 +25,7 @@ export default function Home() {
     const [jobId, setJobId] = useState<string | null>(null);
     const [jobStatus, setJobStatus] = useState<string>("");
     const [progress, setProgress] = useState<number>(0);
-    const [resultData, setResultData] = useState<any>(null);
+    const [resultData, setResultData] = useState<JobResultData | null>(null);
     const [errorMessage, setErrorMessage] = useState<string>("");
     // Percentage of the file actually transferred to the server so far --
     // separate from `progress` above (which tracks Celery/Spark progress
