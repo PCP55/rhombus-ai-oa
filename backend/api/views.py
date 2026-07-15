@@ -9,7 +9,7 @@ from django.shortcuts import get_object_or_404
 from django.views.decorators.csrf import csrf_exempt
 
 from .models import ProcessingJob
-from .services.columns import read_columns
+from .services.read_columns import read_columns
 from .tasks import process_file_task
 
 logger = logging.getLogger(__name__)
