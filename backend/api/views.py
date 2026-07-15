@@ -11,6 +11,12 @@ from .models import ProcessingJob
 from .tasks import process_file_task
 
 
+# @csrf_exempt is correct here, not just a shortcut: Django's CSRF protection
+# defends session-cookie-authenticated requests from being forged by another
+# site. This API is stateless (no login session/cookie), called cross-origin
+# by the Next.js frontend via fetch(), so there's no CSRF token to check in
+# the first place. Real authorization is handled instead by
+# RequireAccessKeyMiddleware (APP_ACCESS_KEY) + CORS_ALLOWED_ORIGINS.
 @csrf_exempt
 def upload_file(request):
     if request.method == "POST":
@@ -72,7 +78,7 @@ def check_status(request, job_id):
         return JsonResponse({"error": "Job not found"}, status=404)
 
 
-@csrf_exempt
+@csrf_exempt  # see note on upload_file — no session cookie, so no CSRF token applies
 def cancel_job(request, job_id):
     if request.method == "POST":
         try:
