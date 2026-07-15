@@ -26,6 +26,10 @@ class ProcessingJob(models.Model):
     # Storing the user inputs
     id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
     file = models.FileField(upload_to=job_directory_path)
+    # Populated by upload_file() from the file's real header row. submit_job()
+    # validates target_column against this server-side, rather than trusting
+    # whatever column name the client sends back.
+    columns = models.JSONField(default=list, blank=True)
     # Left blank while the job is a DRAFT -- see upload_file()/submit_job() in views.py.
     target_column = models.CharField(max_length=255, blank=True, default="")
     prompt = models.TextField(blank=True, default="")

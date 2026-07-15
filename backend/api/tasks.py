@@ -1,3 +1,5 @@
+import logging
+
 import polars as pl
 from celery import shared_task
 from django.core.cache import cache
@@ -5,6 +7,8 @@ from django.core.cache import cache
 from .models import ProcessingJob
 from .services.llm import generate_regex
 from .services.spark import process_data_with_spark
+
+logger = logging.getLogger(__name__)
 
 
 @shared_task(
@@ -27,7 +31,7 @@ def process_file_task(self, job_id):
         job.save()
 
         # 2. Extract the Regex
-        print(f"Worker Job {job_id}: Translating prompt to regex...")
+        logger.info("Worker Job %s: Translating prompt to regex...", job_id)
         self.update_state(
             state="RUNNING",
             meta={
@@ -41,17 +45,19 @@ def process_file_task(self, job_id):
         regex_pattern = cache.get(cache_key)
 
         if not regex_pattern:
-            print("Cache miss: Calling LLM...")
+            logger.info("Cache miss: Calling LLM...")
             regex_pattern = generate_regex(prompt=job.prompt)
             cache.set(cache_key, regex_pattern, timeout=86400)  # Cache for 24 hours
         else:
-            print("Cache hit: Pulled regex from Redis!")
+            logger.info("Cache hit: Pulled regex from Redis!")
 
         job.progress = 30
         job.save()
 
         # 3. Process the file
-        print(f"Worker Job {job_id}: Running Spark with pattern '{regex_pattern}'")
+        logger.info(
+            "Worker Job %s: Running Spark with pattern '%s'", job_id, regex_pattern
+        )
         self.update_state(
             state="RUNNING",
             meta={
@@ -89,7 +95,7 @@ def process_file_task(self, job_id):
 
         # 4. Excel to CSV Conversion using Polars
         if file_path.endswith(".xlsx") or file_path.endswith(".xls"):
-            print(f"Worker Job {job_id}: Converting Excel to CSV via Polars...")
+            logger.info("Worker Job %s: Converting Excel to CSV via Polars...", job_id)
             csv_path = file_path.replace(".xlsx", ".csv").replace(".xls", ".csv")
 
             # Read the Excel file and stream it directly to a CSV
@@ -122,4 +128,6 @@ def process_file_task(self, job_id):
         job.error_message = str(e)
         job.save()
 
-        print(f"Worker Job {job_id} FAILED: {str(e)}")
+        # .exception() (vs. .error()) also captures the full traceback, which
+        # a plain print(str(e)) always threw away.
+        logger.exception("Worker Job %s FAILED", job_id)

@@ -1,3 +1,4 @@
+import logging
 import os
 
 import polars as pl
@@ -10,6 +11,8 @@ from django.views.decorators.csrf import csrf_exempt
 from .models import ProcessingJob
 from .services.columns import read_columns
 from .tasks import process_file_task
+
+logger = logging.getLogger(__name__)
 
 # Only these are ever handed to the Excel->CSV converter or read directly by
 # Spark (see tasks.py / services/spark.py) — reject anything else up front
@@ -55,10 +58,19 @@ def upload_file(request):
 
     try:
         columns = read_columns(job.file.path)
-    except Exception as e:
+    except Exception:
+        # Log the real exception server-side (can contain library internals
+        # / filesystem paths) but never echo it back to the client.
+        logger.exception("Failed to read columns for job %s", job.id)
         job.delete()  # also deletes the uploaded file (FileField)
         return JsonResponse(
-            {"error": f"Could not read columns from this file: {e}"}, status=400
+            {
+                "error": (
+                    "Could not read columns from this file. Make sure it's a "
+                    "well-formed CSV or Excel file."
+                )
+            },
+            status=400,
         )
 
     if not columns:
@@ -66,6 +78,12 @@ def upload_file(request):
         return JsonResponse(
             {"error": "No columns were found in the uploaded file."}, status=400
         )
+
+    # Persist the columns we actually found so submit_job() can validate
+    # against them below, instead of trusting whatever target_column the
+    # client sends back.
+    job.columns = columns
+    job.save(update_fields=["columns"])
 
     return JsonResponse({"job_id": job.id, "status": job.status, "columns": columns})
 
@@ -94,6 +112,21 @@ def submit_job(request, job_id):
 
     if not all([target_column, prompt]):
         return JsonResponse({"error": "Missing required fields"}, status=400)
+
+    # The frontend only ever offers columns from job.columns (populated by
+    # upload_file), but the API itself must not trust that -- validate
+    # server-side against what was actually read from the file, rather than
+    # letting a client-supplied column name reach Spark unchecked.
+    if target_column not in job.columns:
+        return JsonResponse(
+            {
+                "error": (
+                    f"'{target_column}' is not a column in the uploaded file. "
+                    f"Available columns: {', '.join(job.columns)}"
+                )
+            },
+            status=400,
+        )
 
     job.target_column = target_column
     job.prompt = prompt
@@ -232,5 +265,9 @@ def get_paginated_results(request, job_id):
             }
         )
 
-    except Exception as e:
-        return JsonResponse({"error": str(e)}, status=500)
+    except Exception:
+        logger.exception("Failed to read paginated results for job %s", job.id)
+        return JsonResponse(
+            {"error": "Could not read the processed results for this job."},
+            status=500,
+        )

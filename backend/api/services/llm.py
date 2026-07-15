@@ -78,13 +78,21 @@ def _time_limit(seconds: float):
 # shapes (nested/overlapping quantifiers, alternation with ambiguous
 # branches) when run against a pattern that is vulnerable to them. A safe
 # regex resolves against all of these in milliseconds; an unsafe one blows
-# up exponentially well before REDOS_TIMEOUT_SECONDS on inputs this short.
+# up exponentially well before REDOS_TIMEOUT_SECONDS. Long enough (120
+# chars) to also catch polynomial (not just exponential) worst cases that
+# might slip through on a very short probe.
+#
+# Caveat: this validates against Python's `re` engine. The actual
+# replacement runs in Spark, i.e. the JVM regex engine (java.util.regex),
+# which can have different worst-case behavior for the same pattern. This
+# guard meaningfully reduces risk but is not a byte-for-byte guarantee of
+# Spark-side safety -- see the README's LLM safety section.
 _REDOS_PROBE_STRINGS = (
-    "a" * 40,
-    "a" * 40 + "!",  # never matches -> forces the engine to exhaust backtracking
-    " " * 40,
-    "-" * 40 + "x",
-    "0" * 40 + ".",
+    "a" * 120,
+    "a" * 120 + "!",  # never matches -> forces the engine to exhaust backtracking
+    " " * 120,
+    "-" * 120 + "x",
+    "0" * 120 + ".",
 )
 
 REDOS_TIMEOUT_SECONDS = 0.5
