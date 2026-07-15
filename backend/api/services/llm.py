@@ -1,4 +1,6 @@
 import re
+import signal
+from contextlib import contextmanager
 
 from dotenv import load_dotenv
 from langchain_core.prompts import PromptTemplate
@@ -46,14 +48,81 @@ def generate_regex(prompt: str) -> str:
     return validate_regex(raw_regex)
 
 
+class _RegexTimeoutError(Exception):
+    """Raised internally when a regex match is taking suspiciously long."""
+
+
+@contextmanager
+def _time_limit(seconds: float):
+    """
+    Unix wall-clock timeout for a block of code, via SIGALRM. Used to bound
+    how long a *single* regex match attempt is allowed to run.
+
+    Only safe to call from the main thread of a process (true for Celery's
+    default prefork worker pool, where each task runs in its own process).
+    """
+
+    def _handle_timeout(signum, frame):
+        raise _RegexTimeoutError()
+
+    previous_handler = signal.signal(signal.SIGALRM, _handle_timeout)
+    signal.setitimer(signal.ITIMER_REAL, seconds)
+    try:
+        yield
+    finally:
+        signal.setitimer(signal.ITIMER_REAL, 0)
+        signal.signal(signal.SIGALRM, previous_handler)
+
+
+# Adversarial inputs chosen to trip up the classic catastrophic-backtracking
+# shapes (nested/overlapping quantifiers, alternation with ambiguous
+# branches) when run against a pattern that is vulnerable to them. A safe
+# regex resolves against all of these in milliseconds; an unsafe one blows
+# up exponentially well before REDOS_TIMEOUT_SECONDS on inputs this short.
+_REDOS_PROBE_STRINGS = (
+    "a" * 40,
+    "a" * 40 + "!",  # never matches -> forces the engine to exhaust backtracking
+    " " * 40,
+    "-" * 40 + "x",
+    "0" * 40 + ".",
+)
+
+REDOS_TIMEOUT_SECONDS = 0.5
+
+
+def _guard_against_catastrophic_backtracking(pattern: str) -> None:
+    """
+    Empirically checks whether `pattern` can be driven into catastrophic
+    backtracking (ReDoS) by matching it against a handful of adversarial
+    strings, each under a hard wall-clock timeout. Raises ValueError if any
+    probe doesn't resolve in time.
+    """
+    compiled = re.compile(pattern)
+
+    for probe in _REDOS_PROBE_STRINGS:
+        try:
+            with _time_limit(REDOS_TIMEOUT_SECONDS):
+                compiled.search(probe)
+        except _RegexTimeoutError:
+            raise ValueError(
+                f"LLM generated a regex pattern that is unsafe to run (catastrophic "
+                f"backtracking risk): {pattern}"
+            )
+
+
 def validate_regex(pattern: str) -> str:
     """
-    Validates that the provided string is a valid Python regular expression.
+    Validates that the provided string is a valid, safe-to-run Python
+    regular expression: syntactically correct, and not vulnerable to
+    catastrophic backtracking (ReDoS) on adversarial input.
     """
     try:
         re.compile(pattern)
-        return pattern
     except re.error as e:
         raise ValueError(
             f"LLM generated an invalid regex pattern: {pattern}. Error: {str(e)}"
         )
+
+    _guard_against_catastrophic_backtracking(pattern)
+
+    return pattern

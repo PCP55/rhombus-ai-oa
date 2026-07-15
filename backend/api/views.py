@@ -8,7 +8,13 @@ from django.shortcuts import get_object_or_404
 from django.views.decorators.csrf import csrf_exempt
 
 from .models import ProcessingJob
+from .services.columns import read_columns
 from .tasks import process_file_task
+
+# Only these are ever handed to the Excel->CSV converter or read directly by
+# Spark (see tasks.py / services/spark.py) — reject anything else up front
+# instead of letting it fail deep inside a background worker.
+ALLOWED_UPLOAD_EXTENSIONS = (".csv", ".xls", ".xlsx")
 
 
 # @csrf_exempt is correct here, not just a shortcut: Django's CSRF protection
@@ -19,32 +25,87 @@ from .tasks import process_file_task
 # RequireAccessKeyMiddleware (APP_ACCESS_KEY) + CORS_ALLOWED_ORIGINS.
 @csrf_exempt
 def upload_file(request):
-    if request.method == "POST":
-        # 1. Grab the file and text data from the incoming request
-        file = request.FILES.get("file")
-        target_column = request.POST.get("target_column")
-        prompt = request.POST.get("prompt")
-        replacement_value = request.POST.get("replacement_value", "")
+    """
+    Step 1 of 2: stores the uploaded file and hands back its column names so
+    the frontend can offer a dropdown instead of a free-text field. Nothing
+    is queued for Celery yet -- the job is created in DRAFT status and only
+    becomes real work once submit_job() below fills in the target column
+    and prompt. Splitting it this way means the (possibly large) file is
+    only ever uploaded once, not once to "preview" it and again to process it.
+    """
+    if request.method != "POST":
+        return JsonResponse({"error": "Invalid request method"}, status=405)
 
-        if not all([file, target_column, prompt]):
-            return JsonResponse({"error": "Missing required fields"}, status=400)
+    file = request.FILES.get("file")
+    if not file:
+        return JsonResponse({"error": "Missing required field: file"}, status=400)
 
-        # 2. Create the "receipt" in the database
-        job = ProcessingJob.objects.create(
-            file=file,
-            target_column=target_column,
-            prompt=prompt,
-            replacement_value=replacement_value,
+    if not file.name.lower().endswith(ALLOWED_UPLOAD_EXTENSIONS):
+        return JsonResponse(
+            {
+                "error": (
+                    f"Unsupported file type '{file.name}'. Only "
+                    f"{', '.join(ALLOWED_UPLOAD_EXTENSIONS)} files are accepted."
+                )
+            },
+            status=400,
         )
 
-        # 3. Hand the ticket to Celery, pinning the Celery task_id to the job_id
-        # so the polling API can look up this task's live state later.
-        process_file_task.apply_async(args=[job.id], task_id=str(job.id))
+    job = ProcessingJob.objects.create(file=file)  # status defaults to DRAFT
 
-        # 4. Instantly return the Job ID to the user
-        return JsonResponse({"job_id": job.id, "status": "QUEUED"}, status=201)
+    try:
+        columns = read_columns(job.file.path)
+    except Exception as e:
+        job.delete()  # also deletes the uploaded file (FileField)
+        return JsonResponse(
+            {"error": f"Could not read columns from this file: {e}"}, status=400
+        )
 
-    return JsonResponse({"error": "Invalid request method"}, status=405)
+    if not columns:
+        job.delete()
+        return JsonResponse(
+            {"error": "No columns were found in the uploaded file."}, status=400
+        )
+
+    return JsonResponse({"job_id": job.id, "status": job.status, "columns": columns})
+
+
+@csrf_exempt  # see note on upload_file above — no session cookie, so no CSRF token applies
+def submit_job(request, job_id):
+    """
+    Step 2 of 2: attaches the target column / NL prompt / replacement value
+    the user picked (after seeing the column dropdown from upload_file) to
+    an existing DRAFT job, then actually queues it for Celery.
+    """
+    if request.method != "POST":
+        return JsonResponse({"error": "Invalid request method"}, status=405)
+
+    job = get_object_or_404(ProcessingJob, id=job_id)
+
+    if job.status != "DRAFT":
+        return JsonResponse(
+            {"error": f"Job has already been submitted (status: {job.status})."},
+            status=400,
+        )
+
+    target_column = request.POST.get("target_column")
+    prompt = request.POST.get("prompt")
+    replacement_value = request.POST.get("replacement_value", "")
+
+    if not all([target_column, prompt]):
+        return JsonResponse({"error": "Missing required fields"}, status=400)
+
+    job.target_column = target_column
+    job.prompt = prompt
+    job.replacement_value = replacement_value
+    job.status = "QUEUED"
+    job.save()
+
+    # Pin the Celery task_id to the job_id so the polling API can look up
+    # this task's live state later.
+    process_file_task.apply_async(args=[job.id], task_id=str(job.id))
+
+    return JsonResponse({"job_id": job.id, "status": "QUEUED"}, status=202)
 
 
 def check_status(request, job_id):
@@ -83,6 +144,13 @@ def cancel_job(request, job_id):
     if request.method == "POST":
         try:
             job = ProcessingJob.objects.get(id=job_id)
+
+            if job.status == "DRAFT":
+                # Never queued for Celery -- nothing to revoke, just discard
+                # the uploaded file/row (e.g. the user picked a different
+                # file after seeing the column dropdown).
+                job.delete()
+                return JsonResponse({"message": "Draft job discarded."})
 
             # Only cancel if it's currently active
             if job.status in ["QUEUED", "RUNNING"]:

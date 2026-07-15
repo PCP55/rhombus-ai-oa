@@ -10,36 +10,41 @@ import { apiFetch } from "../lib/api";
 export default function Home() {
     // 1. Form Input State
     const [file, setFile] = useState<File | null>(null);
+    const [columns, setColumns] = useState<string[]>([]);
     const [targetColumn, setTargetColumn] = useState("");
     const [prompt, setPrompt] = useState("");
     const [replacementValue, setReplacementValue] = useState("");
 
-    // 2. Job Tracking State (Notice: isLoading is gone!)
+    // 2. Job Tracking State
+    // "" -> INSPECTING -> DRAFT -> SUBMITTING -> QUEUED -> RUNNING -> SUCCESS/FAILED
     const [jobId, setJobId] = useState<string | null>(null);
     const [jobStatus, setJobStatus] = useState<string>("");
     const [progress, setProgress] = useState<number>(0);
     const [resultData, setResultData] = useState<any>(null);
     const [errorMessage, setErrorMessage] = useState<string>("");
 
-    // 3. The Submit Handler
-    const onSubmit = async () => {
-        if (!file || !targetColumn.trim() || !prompt.trim()) {
-            alert("Please fill out all required fields.");
-            return;
+    // 3. File Selection Handler — uploads the file immediately (once) and
+    // reads back its real column names, so the form can offer a dropdown
+    // instead of asking the user to type a column name from memory.
+    const onFileSelected = async (selectedFile: File) => {
+        // Discard the previous draft (if any) so we don't leave an orphaned
+        // upload sitting on the server every time someone swaps files.
+        if (jobId && jobStatus === "DRAFT") {
+            apiFetch(`/api/cancel/${jobId}/`, { method: "POST" }).catch(
+                () => {},
+            );
         }
 
-        // Reset tracking state before a fresh run
+        setFile(selectedFile);
         setJobId(null);
-        setJobStatus("SUBMITTING");
-        setProgress(0);
+        setColumns([]);
+        setTargetColumn("");
         setResultData(null);
         setErrorMessage("");
+        setJobStatus("INSPECTING");
 
         const formData = new FormData();
-        formData.append("file", file);
-        formData.append("target_column", targetColumn);
-        formData.append("prompt", prompt);
-        formData.append("replacement_value", replacementValue);
+        formData.append("file", selectedFile);
 
         try {
             const response = await apiFetch("/api/upload/", {
@@ -51,7 +56,50 @@ export default function Home() {
 
             if (response.ok) {
                 setJobId(data.job_id);
-                setJobStatus("QUEUED");
+                setColumns(data.columns || []);
+                setJobStatus("DRAFT");
+            } else {
+                setJobStatus("FAILED");
+                setErrorMessage(
+                    data.error || "Failed to read this file's columns.",
+                );
+            }
+        } catch (error) {
+            console.error(error);
+            setJobStatus("FAILED");
+            setErrorMessage(
+                "Network Error: Could not reach the Django backend.",
+            );
+        }
+    };
+
+    // 4. The Submit Handler — attaches the chosen column/prompt/replacement
+    // to the already-uploaded draft job and actually queues it.
+    const onSubmit = async () => {
+        if (!jobId || !targetColumn.trim() || !prompt.trim()) {
+            alert("Please fill out all required fields.");
+            return;
+        }
+
+        setJobStatus("SUBMITTING");
+        setErrorMessage("");
+
+        const formData = new FormData();
+        formData.append("target_column", targetColumn);
+        formData.append("prompt", prompt);
+        formData.append("replacement_value", replacementValue);
+
+        try {
+            const response = await apiFetch(`/api/submit/${jobId}/`, {
+                method: "POST",
+                body: formData,
+            });
+
+            const data = await response.json();
+
+            if (response.ok) {
+                setProgress(0);
+                setJobStatus(data.status); // "QUEUED"
             } else {
                 setJobStatus("FAILED");
                 setErrorMessage(data.error || "Failed to submit job.");
@@ -65,7 +113,7 @@ export default function Home() {
         }
     };
 
-    // 4. The Cancel Handler (Newly added!)
+    // 5. The Cancel Handler
     const onCancel = async () => {
         if (!jobId) return;
 
@@ -80,11 +128,11 @@ export default function Home() {
         }
     };
 
-    // 5. The Poller (Background Listener)
+    // 6. The Poller (Background Listener) — only once the job is actually
+    // queued/running in Celery; DRAFT/INSPECTING have nothing to poll yet.
     useEffect(() => {
         let intervalId: ReturnType<typeof setInterval>;
 
-        // ONLY start asking if we actually have a jobId and it is actively running
         if (jobId && (jobStatus === "QUEUED" || jobStatus === "RUNNING")) {
             intervalId = setInterval(async () => {
                 try {
@@ -116,7 +164,7 @@ export default function Home() {
         return () => clearInterval(intervalId);
     }, [jobId, jobStatus]);
 
-    // 6. The UI Render
+    // 7. The UI Render
     return (
         <main className="min-h-screen bg-gray-50 flex items-center justify-center p-6">
             <div className="bg-white w-full max-w-xl rounded-xl shadow-sm p-8">
@@ -127,23 +175,24 @@ export default function Home() {
                     Upload a CSV and define your dynamic regex rules.
                 </p>
 
-                <FileDropzone file={file} setFile={setFile} />
+                <FileDropzone
+                    file={file}
+                    onFileSelected={onFileSelected}
+                    isInspecting={jobStatus === "INSPECTING"}
+                />
 
                 <ExtractionForm
+                    columns={columns}
                     targetColumn={targetColumn}
                     setTargetColumn={setTargetColumn}
                     prompt={prompt}
                     setPrompt={setPrompt}
-
-                    // Perfectly mapped variables to match the interface contract
                     replacement={replacementValue}
                     setReplacement={setReplacementValue}
-
                     jobStatus={jobStatus}
                     progress={progress}
                     resultData={resultData}
                     errorMessage={errorMessage}
-
                     onSubmit={onSubmit}
                     onCancel={onCancel}
                 />
