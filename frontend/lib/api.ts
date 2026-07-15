@@ -19,3 +19,59 @@ export function apiFetch(path: string, init: RequestInit = {}) {
 
     return fetch(`${API_BASE_URL}${path}`, { ...init, headers });
 }
+
+export interface UploadResult {
+    ok: boolean;
+    status: number;
+    data: any;
+}
+
+/**
+ * POSTs `formData` to the Django API with real upload-progress reporting.
+ *
+ * fetch() intentionally has no way to observe request-body upload progress
+ * (only download/response progress via ReadableStream) -- so for a
+ * multi-hundred-MB/multi-GB file, apiFetch() would otherwise look "stuck"
+ * for however long the transfer takes, with no feedback at all.
+ * XMLHttpRequest's `upload.onprogress` is the one browser API that still
+ * exposes this, so this uses XHR instead of fetch specifically for uploads.
+ */
+export function apiUploadWithProgress(
+    path: string,
+    formData: FormData,
+    onProgress?: (percent: number) => void,
+): Promise<UploadResult> {
+    return new Promise((resolve, reject) => {
+        const xhr = new XMLHttpRequest();
+        xhr.open("POST", `${API_BASE_URL}${path}`);
+        if (ACCESS_KEY) {
+            xhr.setRequestHeader("X-Access-Key", ACCESS_KEY);
+        }
+
+        xhr.upload.onprogress = (event) => {
+            if (onProgress && event.lengthComputable) {
+                onProgress(Math.round((event.loaded / event.total) * 100));
+            }
+        };
+
+        xhr.onload = () => {
+            let data: any = null;
+            try {
+                data = xhr.responseText ? JSON.parse(xhr.responseText) : null;
+            } catch {
+                data = null;
+            }
+            resolve({
+                ok: xhr.status >= 200 && xhr.status < 300,
+                status: xhr.status,
+                data,
+            });
+        };
+
+        xhr.onerror = () =>
+            reject(new Error("Network error while uploading the file."));
+        xhr.onabort = () => reject(new Error("Upload was cancelled."));
+
+        xhr.send(formData);
+    });
+}

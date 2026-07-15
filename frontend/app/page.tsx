@@ -5,7 +5,7 @@ import ExtractionForm from "../components/ExtractionForm";
 import FileDropzone from "../components/FileDropzone";
 
 import ResultsTable from "../components/ResultsTable";
-import { apiFetch } from "../lib/api";
+import { apiFetch, apiUploadWithProgress } from "../lib/api";
 
 export default function Home() {
     // 1. Form Input State
@@ -22,6 +22,11 @@ export default function Home() {
     const [progress, setProgress] = useState<number>(0);
     const [resultData, setResultData] = useState<any>(null);
     const [errorMessage, setErrorMessage] = useState<string>("");
+    // Percentage of the file actually transferred to the server so far --
+    // separate from `progress` above (which tracks Celery/Spark progress
+    // once the job is queued). Large files can take a while just to upload,
+    // well before there's any job to poll status for.
+    const [uploadProgress, setUploadProgress] = useState<number>(0);
 
     // 3. File Selection Handler — uploads the file immediately (once) and
     // reads back its real column names, so the form can offer a dropdown
@@ -41,27 +46,27 @@ export default function Home() {
         setTargetColumn("");
         setResultData(null);
         setErrorMessage("");
+        setUploadProgress(0);
         setJobStatus("INSPECTING");
 
         const formData = new FormData();
         formData.append("file", selectedFile);
 
         try {
-            const response = await apiFetch("/api/upload/", {
-                method: "POST",
-                body: formData,
-            });
+            const { ok, data } = await apiUploadWithProgress(
+                "/api/upload/",
+                formData,
+                setUploadProgress,
+            );
 
-            const data = await response.json();
-
-            if (response.ok) {
+            if (ok) {
                 setJobId(data.job_id);
                 setColumns(data.columns || []);
                 setJobStatus("DRAFT");
             } else {
                 setJobStatus("FAILED");
                 setErrorMessage(
-                    data.error || "Failed to read this file's columns.",
+                    data?.error || "Failed to read this file's columns.",
                 );
             }
         } catch (error) {
@@ -179,6 +184,7 @@ export default function Home() {
                     file={file}
                     onFileSelected={onFileSelected}
                     isInspecting={jobStatus === "INSPECTING"}
+                    uploadProgress={uploadProgress}
                 />
 
                 <ExtractionForm
