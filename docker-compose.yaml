@@ -20,6 +20,13 @@ services:
         environment:
             - CELERY_BROKER_URL=redis://redis:6379/0
             - CELERY_RESULT_BACKEND=redis://redis:6379/0
+            - DJANGO_SECRET_KEY=${DJANGO_SECRET_KEY:-}
+            - DJANGO_DEBUG=${DJANGO_DEBUG:-True}
+            - DJANGO_ALLOWED_HOSTS=${DJANGO_ALLOWED_HOSTS:-localhost,127.0.0.1}
+            - DJANGO_CORS_ALLOWED_ORIGINS=${DJANGO_CORS_ALLOWED_ORIGINS:-http://localhost:3000}
+            - DJANGO_CSRF_TRUSTED_ORIGINS=${DJANGO_CSRF_TRUSTED_ORIGINS:-}
+            - DJANGO_BEHIND_HTTPS_PROXY=${DJANGO_BEHIND_HTTPS_PROXY:-False}
+            - APP_ACCESS_KEY=${APP_ACCESS_KEY:-}
 
     # 3. The Background Task Worker (Celery)
     worker:
@@ -36,6 +43,9 @@ services:
         environment:
             - CELERY_BROKER_URL=redis://redis:6379/0
             - CELERY_RESULT_BACKEND=redis://redis:6379/0
+            - DJANGO_SECRET_KEY=${DJANGO_SECRET_KEY:-}
+            - DJANGO_DEBUG=${DJANGO_DEBUG:-True}
+            - DJANGO_ALLOWED_HOSTS=${DJANGO_ALLOWED_HOSTS:-localhost,127.0.0.1}
 
     # 4. The Spark Master
     spark:
@@ -67,3 +77,20 @@ services:
             resources:
                 limits:
                     memory: 1G
+
+    # 6. The Frontend (Next.js)
+    frontend:
+        build:
+            context: ./frontend
+            dockerfile: Dockerfile
+            args:
+                NEXT_PUBLIC_API_BASE_URL: ${NEXT_PUBLIC_API_BASE_URL:-http://localhost:8000}
+                NEXT_PUBLIC_APP_ACCESS_KEY: ${NEXT_PUBLIC_APP_ACCESS_KEY:-}
+        image: my-nextjs-app:latest
+        ports:
+            - "3000:3000"
+        depends_on:
+            - web
+        environment:
+            - BASIC_AUTH_USER=${BASIC_AUTH_USER:-}
+            - BASIC_AUTH_PASSWORD=${BASIC_AUTH_PASSWORD:-}

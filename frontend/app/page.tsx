@@ -5,6 +5,7 @@ import ExtractionForm from "../components/ExtractionForm";
 import FileDropzone from "../components/FileDropzone";
 
 import ResultsTable from "../components/ResultsTable";
+import { apiFetch } from "../lib/api";
 
 export default function Home() {
     // 1. Form Input State
@@ -41,7 +42,7 @@ export default function Home() {
         formData.append("replacement_value", replacementValue);
 
         try {
-            const response = await fetch("http://localhost:8000/api/upload/", {
+            const response = await apiFetch("/api/upload/", {
                 method: "POST",
                 body: formData,
             });
@@ -59,7 +60,7 @@ export default function Home() {
             console.error(error);
             setJobStatus("FAILED");
             setErrorMessage(
-                "Network Error: Could not reach the Django backend on port 8000.",
+                "Network Error: Could not reach the Django backend.",
             );
         }
     };
@@ -69,7 +70,7 @@ export default function Home() {
         if (!jobId) return;
 
         try {
-            await fetch(`http://localhost:8000/api/cancel/${jobId}/`, {
+            await apiFetch(`/api/cancel/${jobId}/`, {
                 method: "POST",
             });
             setJobStatus("FAILED");
@@ -87,9 +88,7 @@ export default function Home() {
         if (jobId && (jobStatus === "QUEUED" || jobStatus === "RUNNING")) {
             intervalId = setInterval(async () => {
                 try {
-                    const res = await fetch(
-                        `http://localhost:8000/api/status/${jobId}/`,
-                    );
+                    const res = await apiFetch(`/api/status/${jobId}/`);
                     const data = await res.json();
 
                     if (res.ok) {
