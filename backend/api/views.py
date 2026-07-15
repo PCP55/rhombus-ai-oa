@@ -9,8 +9,7 @@ from django.shortcuts import get_object_or_404
 from django.views.decorators.csrf import csrf_exempt
 
 from .models import ProcessingJob
-from .services.read_columns import read_columns
-from .tasks import process_file_task
+from .tasks import process_file_task, read_columns_task
 
 logger = logging.getLogger(__name__)
 
@@ -29,12 +28,9 @@ ALLOWED_UPLOAD_EXTENSIONS = (".csv", ".xls", ".xlsx")
 @csrf_exempt
 def upload_file(request):
     """
-    Step 1 of 2: stores the uploaded file and hands back its column names so
-    the frontend can offer a dropdown instead of a free-text field. Nothing
-    is queued for Celery yet -- the job is created in DRAFT status and only
-    becomes real work once submit_job() below fills in the target column
-    and prompt. Splitting it this way means the (possibly large) file is
-    only ever uploaded once, not once to "preview" it and again to process it.
+    Step 1 of 2: stores the uploaded file and queues background column
+    discovery. The web process only saves the file — parsing happens in
+    read_columns_task. The frontend polls /api/status/ until columns appear.
     """
     if request.method != "POST":
         return JsonResponse({"error": "Invalid request method"}, status=405)
@@ -58,22 +54,9 @@ def upload_file(request):
     try:
         job = ProcessingJob.objects.create(file=file)  # status defaults to DRAFT
 
-        columns = read_columns(job.file.path)
-        if not columns:
-            job.delete()
-            return JsonResponse(
-                {"error": "No columns were found in the uploaded file."}, status=400
-            )
+        read_columns_task.apply_async(args=[job.id], task_id=f"{job.id}-columns")
 
-        # Persist the columns we actually found so submit_job() can validate
-        # against them below, instead of trusting whatever target_column the
-        # client sends back.
-        job.columns = columns
-        job.save(update_fields=["columns"])
-
-        return JsonResponse(
-            {"job_id": str(job.id), "status": job.status, "columns": columns}
-        )
+        return JsonResponse({"job_id": str(job.id), "status": job.status})
 
     except OSError:
         # Disk full, permission denied, temp-dir too small, etc. -- common when
@@ -90,30 +73,14 @@ def upload_file(request):
             },
             status=507,
         )
-    except Exception:
-        # Covers read_columns failures, a missing DB migration (saving the new
-        # `columns` field), and anything else that would otherwise bubble up
-        # as a bare HTML 500 page the frontend can't parse.
-        logger.exception("Upload failed while staging file and reading columns")
-        if job:
-            job.delete()
-        return JsonResponse(
-            {
-                "error": (
-                    "Could not read columns from this file. Make sure it's a "
-                    "well-formed CSV or Excel file."
-                )
-            },
-            status=400,
-        )
 
 
 @csrf_exempt  # see note on upload_file above — no session cookie, so no CSRF token applies
 def submit_job(request, job_id):
     """
     Step 2 of 2: attaches the target column / NL prompt / replacement value
-    the user picked (after seeing the column dropdown from upload_file) to
-    an existing DRAFT job, then actually queues it for Celery.
+    the user picked (after column discovery completes) to an existing DRAFT
+    job, then queues it for Celery processing.
     """
     if request.method != "POST":
         return JsonResponse({"error": "Invalid request method"}, status=405)
@@ -133,8 +100,14 @@ def submit_job(request, job_id):
     if not all([target_column, prompt]):
         return JsonResponse({"error": "Missing required fields"}, status=400)
 
+    if not job.columns:
+        return JsonResponse(
+            {"error": "Column discovery is still in progress. Please wait."},
+            status=400,
+        )
+
     # The frontend only ever offers columns from job.columns (populated by
-    # upload_file), but the API itself must not trust that -- validate
+    # read_columns_task), but the API itself must not trust that -- validate
     # server-side against what was actually read from the file, rather than
     # letting a client-supplied column name reach Spark unchecked.
     if target_column not in job.columns:
@@ -186,6 +159,11 @@ def check_status(request, job_id):
         elif job.status == "FAILED":
             response_data["error_message"] = job.error_message
 
+        # Expose columns while the job is still a draft so the frontend can
+        # poll after upload until background column discovery completes.
+        if job.status == "DRAFT":
+            response_data["columns"] = job.columns
+
         return JsonResponse(response_data)
 
     except ProcessingJob.DoesNotExist:
@@ -199,9 +177,10 @@ def cancel_job(request, job_id):
             job = ProcessingJob.objects.get(id=job_id)
 
             if job.status == "DRAFT":
-                # Never queued for Celery -- nothing to revoke, just discard
-                # the uploaded file/row (e.g. the user picked a different
-                # file after seeing the column dropdown).
+                # Discard draft and stop any in-flight column discovery task.
+                current_app.control.revoke(
+                    f"{job.id}-columns", terminate=True, signal="SIGKILL"
+                )
                 job.delete()
                 return JsonResponse({"message": "Draft job discarded."})
 

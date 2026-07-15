@@ -24,7 +24,7 @@ export function apiFetch(path: string, init: RequestInit = {}) {
 export interface UploadResponse {
     job_id: string;
     status: string;
-    columns: string[];
+    columns?: string[];
     error?: string;
 }
 

@@ -12,6 +12,30 @@ import {
     type JobResultData,
 } from "../lib/api";
 
+/** Poll /api/status/ until columns are populated after upload. */
+async function pollForColumns(jobId: string): Promise<string[]> {
+    for (let attempt = 0; attempt < 60; attempt++) {
+        const res = await apiFetch(`/api/status/${jobId}/`);
+        const data = await res.json();
+
+        if (!res.ok) {
+            throw new Error(data.error || "Failed to read column names.");
+        }
+        if (data.status === "FAILED") {
+            throw new Error(
+                data.error_message || "Could not read columns from this file.",
+            );
+        }
+        if (data.columns?.length) {
+            return data.columns;
+        }
+
+        await new Promise((resolve) => setTimeout(resolve, 1000));
+    }
+
+    throw new Error("Timed out waiting for column discovery.");
+}
+
 export default function Home() {
     // 1. Form Input State
     const [file, setFile] = useState<File | null>(null);
@@ -39,7 +63,7 @@ export default function Home() {
     const onFileSelected = async (selectedFile: File) => {
         // Discard the previous draft (if any) so we don't leave an orphaned
         // upload sitting on the server every time someone swaps files.
-        if (jobId && jobStatus === "DRAFT") {
+        if (jobId && (jobStatus === "DRAFT" || jobStatus === "INSPECTING")) {
             apiFetch(`/api/cancel/${jobId}/`, { method: "POST" }).catch(
                 () => {},
             );
@@ -65,8 +89,11 @@ export default function Home() {
             );
 
             if (result.ok && result.data?.job_id) {
-                setJobId(result.data.job_id);
-                setColumns(result.data.columns || []);
+                const id = result.data.job_id;
+                setJobId(id);
+
+                const discoveredColumns = await pollForColumns(id);
+                setColumns(discoveredColumns);
                 setJobStatus("DRAFT");
             } else {
                 setJobStatus("FAILED");

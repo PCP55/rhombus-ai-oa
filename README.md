@@ -68,10 +68,9 @@ Large files are only transferred once. The UI splits the work into two API
 calls so column discovery doesn't require a second upload:
 
 ```
-1. POST /api/upload/     → store file, read header row, return column names
-                           (ProcessingJob status: DRAFT)
-2. POST /api/submit/     → attach column + NL prompt + replacement, queue Celery
-                           (status: DRAFT → QUEUED → RUNNING → SUCCESS/FAILED)
+1. POST /api/upload/     → store file, queue column discovery (DRAFT)
+                           poll GET /api/status/ until columns appear
+2. POST /api/submit/     → attach inputs, queue Celery (→ QUEUED → RUNNING → SUCCESS/FAILED)
 3. GET  /api/status/     → poll every 2s for progress + result
 4. GET  /api/results/    → paginated processed rows (once SUCCESS)
 ```
@@ -79,10 +78,9 @@ calls so column discovery doesn't require a second upload:
 ### Why this stack
 
 - **Django** owns the API, the `ProcessingJob` model (status/progress
-  persistence), and URL routing. It is intentionally thin — it creates job
-  rows and hands off to Celery; it never runs Spark or LLM calls inline.
-  The one synchronous file touch is reading a single header line for the
-  column dropdown (`services/read_columns.py`).
+  persistence), and URL routing. It is intentionally thin — it stores uploads,
+  enqueues Celery tasks, and serves status/results. It never runs Spark, LLM
+  calls, or file parsing inline (column discovery runs in `read_columns_task`).
 - **Celery + Redis** decouple the request/response cycle from the actual
   work. `submit_job()` returns a `job_id` in milliseconds; all parsing,
   LLM calls, and Spark orchestration happen later in a worker process.
@@ -114,7 +112,7 @@ The frontend adds a second gate: HTTP Basic Auth on the Next.js site itself
 
 | Method | Path | Purpose |
 |--------|------|---------|
-| `POST` | `/api/upload/` | Stage file, return `job_id` + `columns` (DRAFT) |
+| `POST` | `/api/upload/` | Stage file, queue column discovery (DRAFT) |
 | `POST` | `/api/submit/<job_id>/` | Attach inputs, queue Celery (→ QUEUED) |
 | `GET` | `/api/status/<job_id>/` | Poll status, progress, result/error |
 | `POST` | `/api/cancel/<job_id>/` | Cancel running job or discard DRAFT |
@@ -131,7 +129,7 @@ rhombus-ai-oa/
 │   ├── api/
 │   │   ├── models.py             # ProcessingJob (DRAFT/QUEUED/RUNNING/…)
 │   │   ├── views.py              # upload / submit / status / cancel / results
-│   │   ├── tasks.py              # Celery task: LLM → Spark → save result
+│   │   ├── tasks.py              # Celery: column read, LLM → Spark pipeline
 │   │   ├── middleware.py         # access-key gate + upload size cap
 │   │   └── services/
 │   │       ├── read_columns.py   # read header row only (CSV/Excel)
@@ -206,8 +204,8 @@ Compose is the easier path.
 "" → INSPECTING → DRAFT → SUBMITTING → QUEUED → RUNNING → SUCCESS/FAILED
 ```
 
-- **INSPECTING** — file is uploading (XHR progress bar) and/or server is
-  reading the header row.
+- **INSPECTING** — file is uploading (XHR progress bar) and/or a Celery
+  worker is reading column names in the background.
 - **DRAFT** — file is on the server, column dropdown is populated; user
   fills in the form.
 - **QUEUED / RUNNING** — Celery worker is processing; progress bar polls
@@ -247,9 +245,13 @@ The LLM-regex **cache** uses logical database `1` (`django-redis` in
 `CACHES`). Same Redis container, zero extra infrastructure — but a cache
 flush can never wipe in-flight Celery task state.
 
-**The one Celery task.** `process_file_task` (`backend/api/tasks.py`) does
-everything the web process cannot do inline: resolve the regex (cache-or-LLM),
-convert Excel to CSV via Polars if needed, and call `process_data_with_spark`.
+**The Celery tasks.** Two background tasks in `backend/api/tasks.py`:
+
+- `read_columns_task` — parses the uploaded file header (CSV or Excel) so
+  the web process never does file parsing inline.
+- `process_file_task` — resolves the regex (cache-or-LLM), converts Excel
+  to CSV if needed, and runs Spark.
+
 Logging uses Python's `logging` module (not `print`) with a `LOGGING` config
 in `settings.py` so `INFO`-level messages appear in `docker compose logs`.
 
@@ -271,10 +273,10 @@ task writes both `job.progress` (DB) and `self.update_state(..., meta={...})`
 (Celery), which `check_status()` surfaces as `progress_detail` while
 `RUNNING`.
 
-**Failure and cancellation.**
-- Failures are recorded on the job row and surfaced via `/api/status/` — the
-  task does not auto-retry (avoids re-running Spark on permanent errors like
-  bad regex or missing files).
+**Failure, retries, and cancellation.**
+- Transient failures (Redis blips, Spark timeouts) retry up to 3 times with
+  exponential backoff (30s → 60s → 120s). Permanent errors (bad regex, missing
+  file, empty columns) fail immediately without retry.
 - Cancellation calls `revoke(task_id, terminate=True, signal="SIGKILL")` to
   kill a stuck Spark/JVM process, then marks the job `FAILED`.
 
@@ -375,9 +377,6 @@ docker compose up --build -d frontend
 
 - **Single target column.** Model, API, and UI take one column name. Extending
   to multi-column would mean looping `withColumn` in `services/spark.py`.
-- **No Celery auto-retry.** Failed jobs are marked `FAILED` once rather than
-  retried — simpler for a demo deployment; production would retry only
-  transient errors (Redis blips, Spark timeouts).
 - **SQLite for job state.** Fine for a single-Droplet demo; production would
   use Postgres to avoid single-writer lock under concurrent updates.
 - **Django dev server.** `runserver` handles uploads synchronously and is not
@@ -391,6 +390,6 @@ docker compose up --build -d frontend
   needed for a long-lived deployment.
 - **ReDoS guard is Python-only.** JVM regex behavior in Spark is not probed;
   see [LLM integration](#llm-integration--regex-safety).
-- **Excel column read loads full file.** `pl.read_excel()` in `read_columns.py` is
-  synchronous on the web tier. Acceptable because Excel files are not the
-  multi-GB case PySpark is responsible for.
+- **Excel column read runs in Celery.** `pl.read_excel()` in `read_columns_task`
+  loads the full file in the worker, not on the web tier. Acceptable because
+  Excel files are not the multi-GB case PySpark is responsible for.
