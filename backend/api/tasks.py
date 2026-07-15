@@ -25,7 +25,6 @@ def process_file_task(self, job_id):
     try:
         # 1. Fetch the ticket from the database
         job = ProcessingJob.objects.get(id=job_id)
-
         job.status = "RUNNING"
         job.progress = 10
         job.save()

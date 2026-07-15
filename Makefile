@@ -8,3 +8,9 @@ start:
 
 cleanup:
 	docker system prune -a --volumes
+
+stop:
+	docker stop $(docker ps -q)
+
+list:
+	docker ps
