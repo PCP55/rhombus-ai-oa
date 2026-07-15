@@ -57,7 +57,9 @@ def process_data_with_spark(
     num_chunks = min(NUM_PROGRESS_CHUNKS, max(1, total_rows)) if total_rows else 1
     df_transformed = df_transformed.repartition(num_chunks)
 
-    print(f"--- Saving distributed partitions to {output_path} in {num_chunks} chunk(s) ---")
+    print(
+        f"--- Saving distributed partitions to {output_path} in {num_chunks} chunk(s) ---"
+    )
     rows_processed = 0
     for chunk_id in range(num_chunks):
         chunk_df = df_transformed.filter(spark_partition_id() == chunk_id)
