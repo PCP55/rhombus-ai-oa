@@ -61,6 +61,30 @@ def process_file_task(self, job_id):
             },
         )
 
+        # Row-processing progress is scaled into this band of the overall job
+        # progress, leaving room before/after for the LLM and finalization steps.
+        SPARK_PROGRESS_START = 50
+        SPARK_PROGRESS_END = 95
+
+        def report_spark_progress(rows_processed, total_rows):
+            percent = int((rows_processed / total_rows) * 100) if total_rows else 0
+            overall_progress = SPARK_PROGRESS_START + int(
+                percent * (SPARK_PROGRESS_END - SPARK_PROGRESS_START) / 100
+            )
+
+            job.progress = overall_progress
+            job.save(update_fields=["progress"])
+
+            self.update_state(
+                state="RUNNING",
+                meta={
+                    "current": rows_processed,
+                    "total": total_rows,
+                    "percent": percent,
+                    "status": f"Processed {rows_processed}/{total_rows} rows ({percent}%)",
+                },
+            )
+
         file_path = job.file.path
 
         # 4. Excel to CSV Conversion using Polars
@@ -79,6 +103,7 @@ def process_file_task(self, job_id):
             target_column=job.target_column,
             regex_pattern=regex_pattern,
             replacement_value=job.replacement_value,
+            progress_callback=report_spark_progress,
         )
 
         # 5. Save the final results and mark as finished

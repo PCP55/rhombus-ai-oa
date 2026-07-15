@@ -2,6 +2,7 @@ import os
 
 import polars as pl
 from celery import current_app
+from celery.result import AsyncResult
 from django.http import JsonResponse
 from django.shortcuts import get_object_or_404
 from django.views.decorators.csrf import csrf_exempt
@@ -10,6 +11,12 @@ from .models import ProcessingJob
 from .tasks import process_file_task
 
 
+# @csrf_exempt is correct here, not just a shortcut: Django's CSRF protection
+# defends session-cookie-authenticated requests from being forged by another
+# site. This API is stateless (no login session/cookie), called cross-origin
+# by the Next.js frontend via fetch(), so there's no CSRF token to check in
+# the first place. Real authorization is handled instead by
+# RequireAccessKeyMiddleware (APP_ACCESS_KEY) + CORS_ALLOWED_ORIGINS.
 @csrf_exempt
 def upload_file(request):
     if request.method == "POST":
@@ -30,8 +37,9 @@ def upload_file(request):
             replacement_value=replacement_value,
         )
 
-        # 3. Hand the ticket to Celery using .delay()
-        process_file_task.delay(job.id)
+        # 3. Hand the ticket to Celery, pinning the Celery task_id to the job_id
+        # so the polling API can look up this task's live state later.
+        process_file_task.apply_async(args=[job.id], task_id=str(job.id))
 
         # 4. Instantly return the Job ID to the user
         return JsonResponse({"job_id": job.id, "status": "QUEUED"}, status=201)
@@ -50,6 +58,14 @@ def check_status(request, job_id):
             "progress": job.progress,
         }
 
+        # While the job is running, pull the live Celery task state (populated via
+        # self.update_state in process_file_task) to surface fine-grained progress
+        # detail, e.g. percentage of rows processed, alongside the overall progress.
+        if job.status == "RUNNING":
+            task_result = AsyncResult(str(job.id))
+            if isinstance(task_result.info, dict):
+                response_data["progress_detail"] = task_result.info
+
         # Only include the heavy dataset if the job is actually finished
         if job.status == "SUCCESS":
             response_data["result_data"] = job.result_data
@@ -62,7 +78,7 @@ def check_status(request, job_id):
         return JsonResponse({"error": "Job not found"}, status=404)
 
 
-@csrf_exempt
+@csrf_exempt  # see note on upload_file — no session cookie, so no CSRF token applies
 def cancel_job(request, job_id):
     if request.method == "POST":
         try:
