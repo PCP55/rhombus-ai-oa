@@ -174,6 +174,13 @@ CELERY_TASK_SERIALIZER = "json"
 MEDIA_URL = "/media/"
 MEDIA_ROOT = os.path.join(BASE_DIR, "media")
 
+# Large uploads (> FILE_UPLOAD_MAX_MEMORY_SIZE, default 2.5MB) are spooled to
+# disk while Django parses the multipart body. Point that temp dir at the same
+# mounted volume as MEDIA_ROOT instead of the container's /tmp -- on a small
+# droplet /tmp is often a memory-backed tmpfs that can't hold a multi-GB file.
+FILE_UPLOAD_TEMP_DIR = os.path.join(MEDIA_ROOT, ".upload-tmp")
+os.makedirs(FILE_UPLOAD_TEMP_DIR, exist_ok=True)
+
 CORS_ALLOWED_ORIGINS = _get_list_env("DJANGO_CORS_ALLOWED_ORIGINS", "http://localhost:3000")
 
 # django-cors-headers only allows a small default header set through its

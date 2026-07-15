@@ -24,6 +24,11 @@ export interface UploadResult {
     ok: boolean;
     status: number;
     data: any;
+    // Raw response body, kept around so callers can surface *something*
+    // useful (status code, a snippet of an HTML error page, etc.) when the
+    // response wasn't valid JSON -- e.g. a proxy/gateway timeout page, or a
+    // worker crashing before Django gets a chance to return real JSON.
+    rawText: string;
 }
 
 /**
@@ -65,13 +70,58 @@ export function apiUploadWithProgress(
                 ok: xhr.status >= 200 && xhr.status < 300,
                 status: xhr.status,
                 data,
+                rawText: xhr.responseText || "",
             });
         };
 
         xhr.onerror = () =>
-            reject(new Error("Network error while uploading the file."));
+            reject(
+                new Error(
+                    "Network error while uploading the file (connection dropped or was refused).",
+                ),
+            );
         xhr.onabort = () => reject(new Error("Upload was cancelled."));
+        xhr.ontimeout = () =>
+            reject(new Error("Upload timed out before the server responded."));
 
         xhr.send(formData);
     });
+}
+
+/** Turn an upload API result into a user-visible error string. */
+export function formatUploadError(result: UploadResult): string {
+    if (result.data?.error) {
+        return result.data.error;
+    }
+
+    if (result.status === 413) {
+        return "Uploaded file is too large for the server limit.";
+    }
+    if (result.status === 401) {
+        return "Unauthorized — the API access key may be missing or wrong.";
+    }
+    if (result.status === 507) {
+        return (
+            "The server could not store this file — it may be out of disk space."
+        );
+    }
+    if (result.status >= 500) {
+        return (
+            `Server error (HTTP ${result.status}) while saving the upload. ` +
+            "Check `docker compose logs web` on the droplet for details."
+        );
+    }
+
+    if (result.rawText) {
+        const snippet = result.rawText
+            .replace(/<[^>]+>/g, " ")
+            .replace(/\s+/g, " ")
+            .trim()
+            .slice(0, 200);
+        if (snippet) {
+            return `Upload failed (HTTP ${result.status}): ${snippet}`;
+        }
+    }
+
+    return `Upload failed (HTTP ${result.status || "unknown"}).`;
 }

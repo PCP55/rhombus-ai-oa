@@ -54,15 +54,49 @@ def upload_file(request):
             status=400,
         )
 
-    job = ProcessingJob.objects.create(file=file)  # status defaults to DRAFT
-
+    job = None
     try:
+        job = ProcessingJob.objects.create(file=file)  # status defaults to DRAFT
+
         columns = read_columns(job.file.path)
+        if not columns:
+            job.delete()
+            return JsonResponse(
+                {"error": "No columns were found in the uploaded file."}, status=400
+            )
+
+        # Persist the columns we actually found so submit_job() can validate
+        # against them below, instead of trusting whatever target_column the
+        # client sends back.
+        job.columns = columns
+        job.save(update_fields=["columns"])
+
+        return JsonResponse(
+            {"job_id": str(job.id), "status": job.status, "columns": columns}
+        )
+
+    except OSError:
+        # Disk full, permission denied, temp-dir too small, etc. -- common when
+        # a multi-GB upload lands on a small droplet.
+        logger.exception("Failed to store uploaded file for upload request")
+        if job:
+            job.delete()
+        return JsonResponse(
+            {
+                "error": (
+                    "The server could not store this file. It may be out of disk "
+                    "space, or the upload may exceed the configured size limit."
+                )
+            },
+            status=507,
+        )
     except Exception:
-        # Log the real exception server-side (can contain library internals
-        # / filesystem paths) but never echo it back to the client.
-        logger.exception("Failed to read columns for job %s", job.id)
-        job.delete()  # also deletes the uploaded file (FileField)
+        # Covers read_columns failures, a missing DB migration (saving the new
+        # `columns` field), and anything else that would otherwise bubble up
+        # as a bare HTML 500 page the frontend can't parse.
+        logger.exception("Upload failed while staging file and reading columns")
+        if job:
+            job.delete()
         return JsonResponse(
             {
                 "error": (
@@ -72,20 +106,6 @@ def upload_file(request):
             },
             status=400,
         )
-
-    if not columns:
-        job.delete()
-        return JsonResponse(
-            {"error": "No columns were found in the uploaded file."}, status=400
-        )
-
-    # Persist the columns we actually found so submit_job() can validate
-    # against them below, instead of trusting whatever target_column the
-    # client sends back.
-    job.columns = columns
-    job.save(update_fields=["columns"])
-
-    return JsonResponse({"job_id": job.id, "status": job.status, "columns": columns})
 
 
 @csrf_exempt  # see note on upload_file above — no session cookie, so no CSRF token applies

@@ -5,7 +5,7 @@ import ExtractionForm from "../components/ExtractionForm";
 import FileDropzone from "../components/FileDropzone";
 
 import ResultsTable from "../components/ResultsTable";
-import { apiFetch, apiUploadWithProgress } from "../lib/api";
+import { apiFetch, apiUploadWithProgress, formatUploadError } from "../lib/api";
 
 export default function Home() {
     // 1. Form Input State
@@ -53,27 +53,27 @@ export default function Home() {
         formData.append("file", selectedFile);
 
         try {
-            const { ok, data } = await apiUploadWithProgress(
+            const result = await apiUploadWithProgress(
                 "/api/upload/",
                 formData,
                 setUploadProgress,
             );
 
-            if (ok) {
-                setJobId(data.job_id);
-                setColumns(data.columns || []);
+            if (result.ok && result.data?.job_id) {
+                setJobId(result.data.job_id);
+                setColumns(result.data.columns || []);
                 setJobStatus("DRAFT");
             } else {
                 setJobStatus("FAILED");
-                setErrorMessage(
-                    data?.error || "Failed to read this file's columns.",
-                );
+                setErrorMessage(formatUploadError(result));
             }
         } catch (error) {
             console.error(error);
             setJobStatus("FAILED");
             setErrorMessage(
-                "Network Error: Could not reach the Django backend.",
+                error instanceof Error
+                    ? error.message
+                    : "Network Error: Could not reach the Django backend.",
             );
         }
     };

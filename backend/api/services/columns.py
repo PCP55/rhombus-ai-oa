@@ -29,7 +29,20 @@ def read_columns(file_path: str) -> list[str]:
     # the file, so this stays instant even for a multi-GB upload. Python's
     # csv module (not a naive `line.split(",")`) correctly handles a quoted
     # header value that itself contains a comma or newline.
-    with open(file_path, "r", encoding="utf-8-sig", newline="") as f:
-        first_line = f.readline()
+    #
+    # Try a few common encodings -- real-world CSV exports aren't always UTF-8.
+    last_decode_error: UnicodeDecodeError | None = None
+    for encoding in ("utf-8-sig", "utf-8", "latin-1"):
+        try:
+            with open(file_path, "r", encoding=encoding, newline="") as f:
+                first_line = f.readline()
+            if not first_line.strip():
+                return []
+            return next(csv.reader([first_line]))
+        except UnicodeDecodeError as exc:
+            last_decode_error = exc
 
-    return next(csv.reader([first_line]))
+    if last_decode_error:
+        raise last_decode_error
+
+    return []

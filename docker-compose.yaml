@@ -10,7 +10,7 @@ services:
             context: ./backend
             dockerfile: Dockerfile
         image: my-django-app:latest
-        command: python manage.py runserver 0.0.0.0:8000
+        command: sh -c "python manage.py migrate --noinput && python manage.py runserver 0.0.0.0:8000"
         volumes:
             - ./backend:/app
         ports:
