@@ -110,7 +110,7 @@ def process_file_task(self, job_id):
         job.status = "SUCCESS"
         job.progress = 100
         job.result_data = {
-            "message": f"Successfully processed data targeting {job.target_column}",
+            "message": f"Target column: {job.target_column}",
             "regex_used": regex_pattern,
             "preview": preview_data,
         }
