@@ -1,8 +1,11 @@
+import logging
 import os
 from typing import Callable, Optional
 
 from pyspark.sql import SparkSession
 from pyspark.sql.functions import col, regexp_replace, spark_partition_id
+
+logger = logging.getLogger(__name__)
 
 # Number of row-chunks to split the write into so we can report incremental
 # progress. Higher = more granular progress updates, but more Spark actions.
@@ -32,7 +35,7 @@ def process_data_with_spark(
         .getOrCreate()
     )
 
-    print(f"--- Loading Data from {file} ---")
+    logger.info("Loading data from %s", file)
     df = spark.read.csv(
         file, header=True, inferSchema=True, multiLine=True, escape='"', quote='"'
     )
@@ -43,7 +46,7 @@ def process_data_with_spark(
         progress_callback(0, total_rows)
 
     # 3. Apply the Regex Transformation
-    print(f"--- Applying Regex to column: {target_column} ---")
+    logger.info("Applying regex to column: %s", target_column)
     df_transformed = df.withColumn(
         target_column,
         regexp_replace(col(target_column), regex_pattern, replacement_value),
@@ -57,8 +60,8 @@ def process_data_with_spark(
     num_chunks = min(NUM_PROGRESS_CHUNKS, max(1, total_rows)) if total_rows else 1
     df_transformed = df_transformed.repartition(num_chunks)
 
-    print(
-        f"--- Saving distributed partitions to {output_path} in {num_chunks} chunk(s) ---"
+    logger.info(
+        "Saving distributed partitions to %s in %d chunk(s)", output_path, num_chunks
     )
     rows_processed = 0
     for chunk_id in range(num_chunks):
@@ -74,7 +77,7 @@ def process_data_with_spark(
             progress_callback(rows_processed, total_rows)
 
     # 5. Grab a small preview for the frontend
-    print("--- Generating 50-row preview for the UI ---")
+    logger.info("Generating 50-row preview for the UI")
     preview_df = df_transformed.limit(50)
     preview_results = [row.asDict() for row in preview_df.collect()]
 

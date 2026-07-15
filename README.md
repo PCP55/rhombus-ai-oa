@@ -294,7 +294,12 @@ checks before it's cached or handed to Spark:
    500ms wall-clock timeout (`SIGALRM`-based). If any probe doesn't resolve
    in time, the pattern is rejected outright instead of ever reaching
    Spark, where it would otherwise be free to peg a CPU core indefinitely
-   against real user data.
+   against real user data. **Caveat:** this validates against Python's `re`
+   engine; the actual replacement runs on Spark's JVM regex engine
+   (`java.util.regex`), which can behave differently in edge cases for the
+   same pattern. This guard meaningfully reduces risk but isn't a
+   byte-for-byte guarantee of Spark-side safety — a production system would
+   add a matching JVM-side probe.
 
 Only patterns that pass both checks get cached in Redis
 (`regex_prompt_<normalized prompt>`, 24h TTL) and applied to the data.
@@ -326,20 +331,42 @@ Two independent access controls gate it, since there's no full user-account
 system:
 
 - **`RequireAccessKeyMiddleware`** (`backend/api/middleware.py`) — every API
-  request must carry `X-Access-Key: <APP_ACCESS_KEY>`. The frontend attaches
-  it automatically via `lib/api.ts` once `NEXT_PUBLIC_APP_ACCESS_KEY` is set
-  at build time. No-ops entirely if `APP_ACCESS_KEY` is unset.
+  request must carry `X-Access-Key: <APP_ACCESS_KEY>`, checked with
+  `hmac.compare_digest` (not `!=`) to avoid leaking timing information about
+  how much of the key matched. The frontend attaches it automatically via
+  `lib/api.ts` once `NEXT_PUBLIC_APP_ACCESS_KEY` is set at build time.
+  No-ops entirely if `APP_ACCESS_KEY` is unset.
 - **HTTP Basic Auth** (`frontend/middleware.ts`) — gates the site itself,
   driven by `BASIC_AUTH_USER` / `BASIC_AUTH_PASSWORD`, read at request time
   (a plain container restart picks up changes, no rebuild needed).
+- **`MaxUploadSizeMiddleware`** (`backend/api/middleware.py`) — rejects any
+  request whose declared `Content-Length` exceeds `MAX_UPLOAD_SIZE_MB`
+  (default 200MB) with a `413`, before Django reads any of the body. There's
+  no reverse proxy in front of this app to enforce this at a lower layer, so
+  it's done here.
 
 See `.env.example` for the full list of deployment variables and inline
 notes on which are build-time vs. runtime.
 
-`DJANGO_DEBUG` is currently `True` on the live deployment while
-functionality is being verified end-to-end; it must be flipped to `False`
-(along with setting a real `DJANGO_SECRET_KEY` and `APP_ACCESS_KEY`) before
-treating the deployment as final.
+### Pre-launch checklist
+
+Before sharing the deployed URL with anyone outside the team:
+
+- [ ] `DJANGO_DEBUG=False` (currently intentionally `True` while
+      functionality is being verified end-to-end — verbose error pages leak
+      internals and must not be public).
+- [ ] A real, random `DJANGO_SECRET_KEY` is set (not the `django-insecure-...`
+      dev default).
+- [ ] `APP_ACCESS_KEY` and `BASIC_AUTH_USER`/`BASIC_AUTH_PASSWORD` are set to
+      real values and only shared with the intended reviewer.
+- [ ] Django's `/admin/` either has no superuser created, or a strong
+      password if one exists — it's intentionally exempt from the access-key
+      gate (its own login already protects it), so it's reachable by anyone
+      with the URL.
+- [ ] Understand that without TLS, Basic Auth credentials, the access key,
+      and uploaded file contents all travel in cleartext over plain HTTP —
+      acceptable for a short-lived graded demo on a bare IP, not for
+      anything sensitive or long-lived.
 
 ## Trade-offs & known limitations
 
@@ -364,4 +391,6 @@ treating the deployment as final.
   then abandons the page without ever submitting or picking a different
   file, that `DRAFT` row and its uploaded file are never cleaned up. A real
   deployment would add a periodic task (Celery beat, or a simple cron'd
-  management command) to delete `DRAFT` jobs older than, say, 24 hours.
+  management command) to delete `DRAFT` jobs older than, say, 24 hours, and
+  a per-IP upload rate limit — `MaxUploadSizeMiddleware` caps how big any
+  single request can be, but not how many a client can send.

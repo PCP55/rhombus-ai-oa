@@ -68,6 +68,9 @@ INSTALLED_APPS = [
 ]
 
 MIDDLEWARE = [
+    # Reject oversized request bodies (e.g. a huge upload) before Django
+    # buffers any of it into memory/disk -- runs first, ahead of everything else.
+    "api.middleware.MaxUploadSizeMiddleware",
     "corsheaders.middleware.CorsMiddleware",
     "django.middleware.security.SecurityMiddleware",
     "django.contrib.sessions.middleware.SessionMiddleware",
@@ -192,4 +195,31 @@ CACHES = {
             "CLIENT_CLASS": "django_redis.client.DefaultClient",
         },
     }
+}
+
+# Without this, Django's default logging config only surfaces WARNING+ to
+# the console (via Python's logging.lastResort handler) -- any logger.info()
+# call in our own code (api/tasks.py, api/services/*, api/views.py) would be
+# silently dropped instead of showing up in `docker compose logs worker`/`web`
+# the way print() used to. disable_existing_loggers stays False (the
+# default) so Django's own request/server logging is untouched; this just
+# adds a root handler everything else propagates up into.
+LOGGING = {
+    "version": 1,
+    "disable_existing_loggers": False,
+    "formatters": {
+        "simple": {
+            "format": "%(asctime)s %(levelname)s %(name)s: %(message)s",
+        },
+    },
+    "handlers": {
+        "console": {
+            "class": "logging.StreamHandler",
+            "formatter": "simple",
+        },
+    },
+    "root": {
+        "handlers": ["console"],
+        "level": "INFO",
+    },
 }

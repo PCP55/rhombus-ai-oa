@@ -27,6 +27,7 @@ services:
             - DJANGO_CSRF_TRUSTED_ORIGINS=${DJANGO_CSRF_TRUSTED_ORIGINS:-}
             - DJANGO_BEHIND_HTTPS_PROXY=${DJANGO_BEHIND_HTTPS_PROXY:-False}
             - APP_ACCESS_KEY=${APP_ACCESS_KEY:-}
+            - MAX_UPLOAD_SIZE_MB=${MAX_UPLOAD_SIZE_MB:-200}
 
     # 3. The Background Task Worker (Celery)
     worker:
