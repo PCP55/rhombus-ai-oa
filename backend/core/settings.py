@@ -16,21 +16,28 @@ from pathlib import Path
 from corsheaders.defaults import default_headers
 from dotenv import load_dotenv
 
-# Loads backend/.env for local development. In Docker/production, real
-# environment variables (from docker-compose/the host) take precedence over
-# anything load_dotenv() finds, so this is safe to call unconditionally.
-load_dotenv()
-
 # Build paths inside the project like this: BASE_DIR / 'subdir'.
 BASE_DIR = Path(__file__).resolve().parent.parent
 
+env_path = BASE_DIR.parent / ".env"
+load_dotenv(env_path)
+
 
 def _get_bool_env(name: str, default: bool = False) -> bool:
-    return os.environ.get(name, str(default)).strip().lower() in ("1", "true", "yes", "on")
+    return os.environ.get(name, str(default)).strip().lower() in (
+        "1",
+        "true",
+        "yes",
+        "on",
+    )
 
 
 def _get_list_env(name: str, default: str = "") -> list[str]:
-    return [item.strip() for item in os.environ.get(name, default).split(",") if item.strip()]
+    return [
+        item.strip()
+        for item in os.environ.get(name, default).split(",")
+        if item.strip()
+    ]
 
 
 # SECURITY WARNING: don't run with debug turned on in production!
@@ -46,8 +53,8 @@ if not SECRET_KEY:
     else:
         raise RuntimeError(
             "DJANGO_SECRET_KEY environment variable must be set when DEBUG=False. "
-            "Generate one with: python -c \"from django.core.management.utils import "
-            "get_random_secret_key; print(get_random_secret_key())\""
+            'Generate one with: python -c "from django.core.management.utils import '
+            'get_random_secret_key; print(get_random_secret_key())"'
         )
 
 # Comma-separated list, e.g. "yourdomain.com,api.yourdomain.com,203.0.113.10"
@@ -181,7 +188,9 @@ MEDIA_ROOT = os.path.join(BASE_DIR, "media")
 FILE_UPLOAD_TEMP_DIR = os.path.join(MEDIA_ROOT, ".upload-tmp")
 os.makedirs(FILE_UPLOAD_TEMP_DIR, exist_ok=True)
 
-CORS_ALLOWED_ORIGINS = _get_list_env("DJANGO_CORS_ALLOWED_ORIGINS", "http://localhost:3000")
+CORS_ALLOWED_ORIGINS = _get_list_env(
+    "DJANGO_CORS_ALLOWED_ORIGINS", "http://localhost:3000"
+)
 
 # django-cors-headers only allows a small default header set through its
 # preflight checks — X-Access-Key (see api/middleware.py) needs to be added

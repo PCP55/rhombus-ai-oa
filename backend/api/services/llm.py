@@ -1,12 +1,17 @@
 import re
 import signal
 from contextlib import contextmanager
+from pathlib import Path
 
 from dotenv import load_dotenv
 from langchain_core.prompts import PromptTemplate
 from langchain_google_genai import ChatGoogleGenerativeAI
 
-load_dotenv()
+current_file = Path(__file__).resolve()
+root_dir = current_file.parents[3]
+env_path = root_dir / ".env"
+
+load_dotenv(env_path)
 
 
 def generate_regex(prompt: str) -> str:
@@ -134,3 +139,7 @@ def validate_regex(pattern: str) -> str:
     _guard_against_catastrophic_backtracking(pattern)
 
     return pattern
+
+
+if __name__ == "__main__":
+    generate_regex("Please generate regex pattern for detecting email addresses")
