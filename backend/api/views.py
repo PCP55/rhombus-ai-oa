@@ -13,16 +13,15 @@ from .tasks import process_file_task, read_columns_task
 
 logger = logging.getLogger(__name__)
 
-
 ALLOWED_UPLOAD_EXTENSIONS = (".csv", ".xls", ".xlsx")
 
 
 @csrf_exempt
 def upload_file(request):
     """
-    Step 1 of 2: stores the uploaded file and queues background column
-    discovery. The web process only saves the file — parsing happens in
-    read_columns_task. The frontend polls /api/status/ until columns appear.
+    Step 1 of 2 (The "Thin" API Gateway):
+    Stores the uploaded file in Django but immediately delegates the heavy
+    lifting (reading the file) to Celery.
     """
     if request.method != "POST":
         return JsonResponse({"error": "Invalid request method"}, status=405)
@@ -44,8 +43,12 @@ def upload_file(request):
 
     job = None
     try:
-        job = ProcessingJob.objects.create(file=file)  # status defaults to DRAFT
+        # STATE MANAGEMENT: This creates the permanent record in SQLite.
+        # The default status in the model is "DRAFT".
+        job = ProcessingJob.objects.create(file=file)
 
+        # MESSAGE BROKER: Django drops a message into Redis (db 0) for Celery.
+        # apply_async is non-blocking, so this returns instantly to the frontend.
         read_columns_task.apply_async(args=[job.id], task_id=f"{job.id}-columns")
 
         return JsonResponse({"job_id": str(job.id), "status": job.status})
@@ -65,18 +68,19 @@ def upload_file(request):
         )
 
 
-@csrf_exempt  # see note on upload_file above — no session cookie, so no CSRF token applies
+@csrf_exempt  # No session cookie used, so CSRF token does not apply for this API
 def submit_job(request, job_id):
     """
-    Step 2 of 2: attaches the target column / NL prompt / replacement value
-    the user picked (after column discovery completes) to an existing DRAFT
-    job, then queues it for Celery processing.
+    Step 2 of 2:
+    Validates the user's inputs against the columns Celery discovered,
+    then queues the main PySpark processing task.
     """
     if request.method != "POST":
         return JsonResponse({"error": "Invalid request method"}, status=405)
 
     job = get_object_or_404(ProcessingJob, id=job_id)
 
+    # State Machine Check: Ensure the user doesn't double-submit
     if job.status != "DRAFT":
         return JsonResponse(
             {"error": f"Job has already been submitted (status: {job.status})."},
@@ -90,6 +94,7 @@ def submit_job(request, job_id):
     if not all([target_column, prompt]):
         return JsonResponse({"error": "Missing required fields"}, status=400)
 
+    # Server-Side Allowlist Validation: Prevents users from injecting bad column names
     if not job.columns:
         return JsonResponse(
             {"error": "Column discovery is still in progress. Please wait."},
@@ -107,22 +112,27 @@ def submit_job(request, job_id):
             status=400,
         )
 
+    # Update SQLite with the final execution parameters
     job.target_column = target_column
     job.prompt = prompt
     job.replacement_value = replacement_value
     job.status = "QUEUED"
     job.save()
 
-    # Pin the Celery task_id to the job_id so the polling API can look up
-    # this task's live state later.
+    # CORE ARCHITECTURE DECISION: We force the Celery task ID to exactly match
+    # the SQLite job ID. This allows us to query Redis for live worker status later.
     process_file_task.apply_async(args=[job.id], task_id=str(job.id))
 
     return JsonResponse({"job_id": job.id, "status": "QUEUED"}, status=202)
 
 
 def check_status(request, job_id):
-    """Returns the current progress and data of a specific job."""
+    """
+    The Polling Endpoint.
+    This view reads from BOTH SQLite (for business status) and Redis (for live worker progress).
+    """
     try:
+        # 1. Read the permanent business state from SQLite
         job = ProcessingJob.objects.get(id=job_id)
 
         response_data = {
@@ -131,9 +141,8 @@ def check_status(request, job_id):
             "progress": job.progress,
         }
 
-        # While the job is running, pull the live Celery task state (populated via
-        # self.update_state in process_file_task) to surface fine-grained progress
-        # detail, e.g. percentage of rows processed, alongside the overall progress.
+        # 2. Read the ephemeral worker state from Redis
+        # If running, interrogates Celery's Result Backend for real-time Spark updates
         if job.status == "RUNNING":
             task_result = AsyncResult(str(job.id))
             if isinstance(task_result.info, dict):
@@ -144,8 +153,7 @@ def check_status(request, job_id):
         elif job.status == "FAILED":
             response_data["error_message"] = job.error_message
 
-        # Expose columns while the job is still a draft so the frontend can
-        # poll after upload until background column discovery completes.
+        # Returns the columns to the frontend so the dropdown can populate
         if job.status == "DRAFT":
             response_data["columns"] = job.columns
 
@@ -157,6 +165,9 @@ def check_status(request, job_id):
 
 @csrf_exempt
 def cancel_job(request, job_id):
+    """
+    Hard-kills a running Celery/Spark process to free up server memory.
+    """
     if request.method == "POST":
         try:
             job = ProcessingJob.objects.get(id=job_id)
@@ -169,13 +180,15 @@ def cancel_job(request, job_id):
                 job.delete()
                 return JsonResponse({"message": "Draft job discarded."})
 
-            # Only cancel if it's currently active
+            # Only cancel if it's currently active in the background
             if job.status in ["QUEUED", "RUNNING"]:
-                # terminate=True forcefully kills the Spark/LLM process mid-execution
+                # terminate=True and SIGKILL operate at the OS level to forcibly
+                # destroy the JVM/Spark worker process immediately.
                 current_app.control.revoke(
                     str(job.id), terminate=True, signal="SIGKILL"
                 )
 
+                # Update SQLite so the frontend stops polling
                 job.status = "FAILED"
                 job.error_message = "Job was cancelled by the user."
                 job.save()
@@ -194,7 +207,8 @@ def cancel_job(request, job_id):
 
 def get_paginated_results(request, job_id):
     """
-    Reads the chunked CSV output from PySpark and returns a specific page.
+    Reads the chunked Parquet output from PySpark and returns a specific page.
+    Uses Polars LazyFrames to avoid loading millions of rows into Django's RAM.
     """
     if request.method != "GET":
         return JsonResponse({"error": "Method not allowed"}, status=405)
@@ -222,14 +236,16 @@ def get_paginated_results(request, job_id):
         )
 
     try:
-        # 3. Lazy scan the entire folder of chunked CSVs
+        # 3. MEMORY OPTIMIZATION: Lazy scan the Parquet files.
+        # This builds a query plan but does NOT load the files into RAM yet.
         lazy_df = pl.scan_parquet(f"{processed_dir}/part-*")
 
-        # 4. Count total rows for the frontend UI (Polars does this almost instantly)
+        # 4. Count total rows for the frontend UI pagination math
         total_rows = lazy_df.select(pl.len()).collect().item()
         total_pages = (total_rows + limit - 1) // limit
 
-        # 5. Extract just the 25 rows we need
+        # 5. Extract just the 25 rows we need.
+        # `.collect()` is called ONLY on the sliced subset, keeping memory usage tiny.
         offset = (page - 1) * limit
         chunk_df = lazy_df.slice(offset, limit).collect()
 

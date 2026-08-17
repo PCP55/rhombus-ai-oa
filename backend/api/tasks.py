@@ -11,13 +11,16 @@ from .services.spark import process_data_with_spark
 
 logger = logging.getLogger(__name__)
 
-# Errors that will never succeed on retry — fail the job immediately.
+# SYSTEM RESILIENCE: We distinguish between "transient" errors (like a network blip)
+# and "permanent" errors (like a missing file). We don't want Celery to waste CPU
+# retrying a job that will definitively fail every time.
 PERMANENT_ERRORS = (ValueError, FileNotFoundError, ProcessingJob.DoesNotExist)
 
 MAX_TASK_RETRIES = 3
 
 
 def _fail_job(job_id, message: str) -> None:
+    """Helper function to cleanly mark a job as failed in the SQLite database."""
     try:
         job = ProcessingJob.objects.get(id=job_id)
         job.status = "FAILED"
@@ -28,7 +31,11 @@ def _fail_job(job_id, message: str) -> None:
 
 
 def _retry_or_fail(task, job_id, exc: Exception) -> None:
-    """Retry transient failures with exponential backoff; fail permanently otherwise."""
+    """
+    FAULT TOLERANCE: Implements Exponential Backoff.
+    If the worker hits a random error (like Redis temporarily dropping), it will
+    wait 30s, then 60s, then 120s before giving up.
+    """
     if isinstance(exc, PERMANENT_ERRORS):
         _fail_job(job_id, str(exc))
         return
@@ -41,7 +48,8 @@ def _retry_or_fail(task, job_id, exc: Exception) -> None:
         exc,
     )
     try:
-        countdown = 30 * (2 ** task.request.retries)  # 30s, 60s, 120s
+        # Exponential backoff formula: 30 * (2 ^ retry_count)
+        countdown = 30 * (2 ** task.request.retries)
         raise task.retry(exc=exc, countdown=countdown, max_retries=MAX_TASK_RETRIES)
     except task.MaxRetriesExceededError:
         _fail_job(job_id, str(exc))
@@ -50,8 +58,9 @@ def _retry_or_fail(task, job_id, exc: Exception) -> None:
 @shared_task(bind=True)
 def read_columns_task(self, job_id):
     """
-    Background column discovery after upload — keeps all file parsing off
-    the Django web process, including full Excel loads.
+    Step 1 Background Task:
+    By pushing this to Celery, we ensure that if a user uploads a massive Excel file,
+    the Django web server doesn't freeze while trying to read the headers.
     """
     try:
         job = ProcessingJob.objects.get(id=job_id)
@@ -61,6 +70,8 @@ def read_columns_task(self, job_id):
             return
 
         job.columns = columns
+        # update_fields is a Django optimization: it only writes the 'columns'
+        # field to SQLite instead of rewriting the entire row.
         job.save(update_fields=["columns"])
         logger.info("Worker Job %s: discovered %d columns", job_id, len(columns))
 
@@ -72,27 +83,32 @@ def read_columns_task(self, job_id):
 @shared_task(bind=True)
 def process_file_task(self, job_id):
     """
-    Runs LLM regex generation, Excel conversion, and Spark replacement in
-    the background — the web process only enqueues this task.
+    Step 2 Background Task (The Main Engine):
+    Orchestrates the LLM, the file format conversion, and the PySpark job.
     """
     try:
         job = ProcessingJob.objects.get(id=job_id)
         job.status = "RUNNING"
         job.progress = 10
-        job.save()
+        job.save() # Updates SQLite (Business State)
 
         logger.info("Worker Job %s: Translating prompt to regex...", job_id)
+
+        # Updates Redis (Worker State) so the frontend gets detailed text updates
         self.update_state(
             state="RUNNING",
             meta={"current": 10, "total": 50, "status": "Extract Regex"},
         )
 
+        # REDIS CACHING (Logical DB 1):
+        # We normalize the prompt (strip/lower) to maximize cache hits.
         cache_key = f"regex_prompt_{job.prompt.strip().lower()}"
         regex_pattern = cache.get(cache_key)
 
         if not regex_pattern:
             logger.info("Cache miss: Calling LLM...")
             regex_pattern = generate_regex(prompt=job.prompt)
+            # Save to Redis for 24 hours (86400 seconds)
             cache.set(cache_key, regex_pattern, timeout=86400)
         else:
             logger.info("Cache hit: Pulled regex from Redis!")
@@ -108,19 +124,25 @@ def process_file_task(self, job_id):
             meta={"current": 50, "total": 100, "status": "Running Spark"},
         )
 
+        # We map Spark's internal progress (0-100%) to our overall job progress (50-95%)
         SPARK_PROGRESS_START = 50
         SPARK_PROGRESS_END = 95
 
         def report_spark_progress(rows_processed, total_rows):
+            """
+            CALLBACK FUNCTION: Spark calls this function after every chunk it processes.
+            This allows us to push live progress to the UI without waiting for
+            the entire million-row file to finish.
+            """
             percent = int((rows_processed / total_rows) * 100) if total_rows else 0
             overall_progress = SPARK_PROGRESS_START + int(
                 percent * (SPARK_PROGRESS_END - SPARK_PROGRESS_START) / 100
             )
 
             job.progress = overall_progress
-            job.save(update_fields=["progress"])
+            job.save(update_fields=["progress"]) # SQLite
 
-            self.update_state(
+            self.update_state(                    # Redis
                 state="RUNNING",
                 meta={
                     "current": rows_processed,
@@ -132,6 +154,9 @@ def process_file_task(self, job_id):
 
         file_path = job.file.path
 
+        # DATA ENGINEERING BRIDGE: PySpark is built for Big Data formats (CSV, Parquet).
+        # It does not support proprietary Excel formats natively. We use Polars here
+        # to rapidly convert the file so Spark can read it.
         if file_path.endswith(".xlsx") or file_path.endswith(".xls"):
             logger.info("Worker Job %s: Converting Excel to CSV via Polars...", job_id)
             csv_path = file_path.replace(".xlsx", ".csv").replace(".xls", ".csv")
@@ -139,6 +164,7 @@ def process_file_task(self, job_id):
             df.write_csv(csv_path)
             file_path = csv_path
 
+        # Actually trigger the PySpark transformation
         preview_data = process_data_with_spark(
             file=file_path,
             target_column=job.target_column,
@@ -147,6 +173,7 @@ def process_file_task(self, job_id):
             progress_callback=report_spark_progress,
         )
 
+        # Job complete. Save the preview data and mark 100%.
         job.status = "SUCCESS"
         job.progress = 100
         job.result_data = {
