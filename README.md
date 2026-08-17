@@ -1,6 +1,6 @@
 # Distributed NL-to-Regex Data Processing Platform
 
-A web app that lets users upload a CSV/Excel file, describe a text pattern in plain English (e.g. _"find email addresses"_), and replace every match at scale. The natural-language description is turned into a regex by an LLM,
+A web app that lets users upload a CSV/Excel file, describe a text pattern in plain English (e.g. _"find email addresses"_), and replace every match. The natural-language description is turned into a regex by an LLM,
 and the actual find-and-replace runs as a distributed PySpark job on a Celery worker — so the web server stays responsive even on multi-million-row files.
 
 ## Demo Video
@@ -9,7 +9,23 @@ and the actual find-and-replace runs as a distributed PySpark job on a Celery wo
 
 The video walks through uploading a file, submitting a natural-language rule, watching the job progress live, and viewing the paginated processed output.
 
-## Architecture
+## How to use
+
+### Steps
+
+1. Drop a `.csv`, `.xls`, or `.xlsx` file. Upload progress is shown in real time (percent + bar). Column names come back for a **dropdown**.
+2. Pick the target column, describe the pattern in plain English, and enter the replacement value.
+3. Submit — the file was already uploaded in step 1, so this is instant. A live progress bar tracks Celery/Spark processing.
+4. Once the job succeeds, a paginated table of processed data appears. Cancel a running job at any time.
+
+## Tech Stack
+
+- **Django** owns the API, the `ProcessingJob` model (status/progress persistence), and URL routing. It is intentionally thin — it stores uploads, enqueues Celery tasks, and serves status/results. It never runs Spark, LLM calls, or file parsing inline (column discovery runs in `read_columns_task`).
+- **Celery + Redis** decouple the request/response cycle from the actual work. `submit_job()` returns a `job_id` in milliseconds; all parsing, LLM calls, and Spark orchestration happen later in a worker process. Redis plays two independent roles — message broker/result backend for Celery (db 0), and a cache for LLM-generated regex patterns (db 1) — on the same Redis container with separate logical databases.
+- **PySpark** is the transformation engine. `regexp_replace` runs as a column expression across partitions, not a Python loop over rows.
+- **Next.js** shows upload progress (XHR), polls job status every 2s, renders a progress bar driven by `job.progress`, and swaps to a paginated results table once the job succeeds.
+
+## How it works
 
 ```
                     ┌─────────────┐
@@ -39,24 +55,26 @@ The video walks through uploading a file, submitting a natural-language rule, wa
                                              └───────────────────┘
 ```
 
-### Request flow (two-step upload)
+### Frontend State Machine
+
+```
+"" → INSPECTING → DRAFT → SUBMITTING → QUEUED → RUNNING → SUCCESS/FAILED
+```
+
+- **INSPECTING** — file is uploading (XHR progress bar) and/or a Celery worker is reading column names in the background.
+- **DRAFT** — file is on the server, column dropdown is populated; user fills in the form.
+- **QUEUED / RUNNING** — Celery worker is processing; progress bar polls `/api/status/` every 2s.
+- **SUCCESS / FAILED** — terminal states; results table or error message.
+
+### Backend Request Flow
 
 Large files are only transferred once. The UI splits the work into two API calls so column discovery doesn't require a second upload:
 
-```
-1. POST /api/upload/     → store file, queue column discovery (DRAFT)
-                           poll GET /api/status/ until columns appear
-2. POST /api/submit/     → attach inputs, queue Celery (→ QUEUED → RUNNING → SUCCESS/FAILED)
-3. GET  /api/status/     → poll every 2s for progress + result
-4. GET  /api/results/    → paginated processed rows (once SUCCESS)
-```
-
-### Why this stack
-
-- **Django** owns the API, the `ProcessingJob` model (status/progress persistence), and URL routing. It is intentionally thin — it stores uploads, enqueues Celery tasks, and serves status/results. It never runs Spark, LLM calls, or file parsing inline (column discovery runs in `read_columns_task`).
-- **Celery + Redis** decouple the request/response cycle from the actual work. `submit_job()` returns a `job_id` in milliseconds; all parsing, LLM calls, and Spark orchestration happen later in a worker process. Redis plays two independent roles — message broker/result backend for Celery (db 0), and a cache for LLM-generated regex patterns (db 1) — on the same Redis container with separate logical databases.
-- **PySpark** is the transformation engine. `regexp_replace` runs as a column expression across partitions, not a Python loop over rows.
-- **Next.js** shows upload progress (XHR), polls job status every 2s, renders a progress bar driven by `job.progress`, and swaps to a paginated results table once the job succeeds.
+1. Stage the file (`POST /api/upload/`): The client posts the file to the server. The server saves it, marks the job as DRAFT, and kicks off a background task to read the column headers.
+2. Poll for discovery (`GET /api/status/<job_id>/`): The client polls the status until the columns are ready to populate the UI dropdown.
+3. Submit the job (`POST /api/submit/<job_id>/`): The client posts the LLM prompt and target column. The job enters the Celery queue.
+4. Poll for progress (`GET /api/status/<job_id>/`): The client polls the status every 2 seconds to drive the UI progress bar.
+5. Fetch results (`GET /api/results/<job_id>/`): Once successful, the client requests the paginated data.
 
 ## API endpoints
 
@@ -91,29 +109,25 @@ rhombus-ai-oa/
 │   ├── middleware.ts              # HTTP Basic Auth gate
 │   └── Dockerfile
 ├── docker-compose.yaml            # redis, web, worker, spark, spark-worker, frontend
-├── .env.example                   # root config (Django, access gate, frontend)
-└── backend/.env.example           # backend-only (GOOGLE_API_KEY, local dev)
+└── .env.example                   # root config (Django, access gate, frontend, GOOGLE_API_KEY)
 ```
 
-## Setup & run (Docker Compose)
+## How to setup and run
 
 **Prerequisites:** Docker + Docker Compose, and a Google Gemini API key
 
 ### 1. Configure environment variables
 
-There are two separate `.env` files because of how they're consumed:
-
-| File               | Used by                          | Purpose                                                                 |
-| ------------------ | -------------------------------- | ----------------------------------------------------------------------- |
-| `.env` (repo root) | `docker-compose.yaml`            | Django security, access gate, frontend build args, `MAX_UPLOAD_SIZE_MB` |
-| `backend/.env`     | `load_dotenv()` in `settings.py` | `GOOGLE_API_KEY` for local/non-Compose runs                             |
+| File               | Used by               | Purpose                                                                 |
+| ------------------ | --------------------- | ----------------------------------------------------------------------- |
+| `.env` (repo root) | `docker-compose.yaml` | Django security, access gate, frontend build args, `MAX_UPLOAD_SIZE_MB` |
 
 **Large files:** bump `MAX_UPLOAD_SIZE_MB` in the root `.env`.
 
 ### 2. Start the stack
 
 ```bash
-docker compose up --build -d
+make start
 ```
 
 This starts: `redis`, `web` (Django `:8000`), `worker` (Celery),
@@ -123,33 +137,17 @@ The `web` service runs `python manage.py migrate --noinput` on every
 startup, so database migrations apply automatically — no manual migrate step
 needed after the first `docker compose up`.
 
+or
+
+```bash
+make build
+```
+
+To rebuild all docker containers again.
+
 ### 3. Open the app
 
-## Using the app
-
-### Job state machine (frontend)
-
-```
-"" → INSPECTING → DRAFT → SUBMITTING → QUEUED → RUNNING → SUCCESS/FAILED
-```
-
-- **INSPECTING** — file is uploading (XHR progress bar) and/or a Celery worker is reading column names in the background.
-- **DRAFT** — file is on the server, column dropdown is populated; user fills in the form.
-- **QUEUED / RUNNING** — Celery worker is processing; progress bar polls `/api/status/` every 2s.
-- **SUCCESS / FAILED** — terminal states; results table or error message.
-
-### Steps
-
-1. Drop a `.csv`, `.xls`, or `.xlsx` file. Upload progress is shown in real time (percent + bar). Column names come back for a **dropdown**.
-2. Pick the target column, describe the pattern in plain English, and enter the replacement value.
-3. Submit — the file was already uploaded in step 1, so this is instant. A live progress bar tracks Celery/Spark processing.
-4. Once the job succeeds, a paginated table of processed data appears. Cancel a running job at any time.
-
-### Validation
-
-- **File extension** — only `.csv`, `.xls`, `.xlsx` accepted (`views.py`).
-- **Target column** — server-side allowlist against columns read at upload time (`ProcessingJob.columns` JSONField); the dropdown is a UX convenience.
-- **Regex** — LLM output is syntax-checked and ReDoS-probed before Spark sees it (`services/llm.py`).
+Navigate to http://<host>:3000 in your browser.
 
 ## Asynchronous processing: Celery + Redis
 
@@ -202,6 +200,12 @@ page. The full result set lives on disk; only ~25 rows at a time hit the browser
 Spark runs as two Compose services (`spark`, `spark-worker`), memory-capped
 (512M / 1G) with `spark.cores.max = 1`, so a single job can't starve the rest
 of the stack on a small Droplet.
+
+## Input Validation & Security
+
+- **File extension** — only `.csv`, `.xls`, `.xlsx` accepted (`views.py`).
+- **Target column** — server-side allowlist against columns read at upload time (`ProcessingJob.columns` JSONField); the dropdown is a UX convenience.
+- **Regex** — LLM output is syntax-checked and ReDoS-probed before Spark sees it (`services/llm.py`).
 
 ## LLM integration & regex safety
 
