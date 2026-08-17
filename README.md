@@ -15,15 +15,18 @@ The video walks through uploading a file, submitting a natural-language rule, wa
 
 1. Drop a `.csv`, `.xls`, or `.xlsx` file. Upload progress is shown in real time (percent + bar). Column names come back for a **dropdown**.
 2. Pick the target column, describe the pattern in plain English, and enter the replacement value.
-3. Submit — the file was already uploaded in step 1, so this is instant. A live progress bar tracks Celery/Spark processing.
+3. Submit — A live progress bar tracks Celery/Spark processing.
 4. Once the job succeeds, a paginated table of processed data appears. Cancel a running job at any time.
 
 ## Tech Stack
 
-- **Django** owns the API, the `ProcessingJob` model (status/progress persistence), and URL routing. It is intentionally thin — it stores uploads, enqueues Celery tasks, and serves status/results. It never runs Spark, LLM calls, or file parsing inline (column discovery runs in `read_columns_task`).
-- **Celery + Redis** decouple the request/response cycle from the actual work. `submit_job()` returns a `job_id` in milliseconds; all parsing, LLM calls, and Spark orchestration happen later in a worker process. Redis plays two independent roles — message broker/result backend for Celery (db 0), and a cache for LLM-generated regex patterns (db 1) — on the same Redis container with separate logical databases.
-- **PySpark** is the transformation engine. `regexp_replace` runs as a column expression across partitions, not a Python loop over rows.
-- **Next.js** shows upload progress (XHR), polls job status every 2s, renders a progress bar driven by `job.progress`, and swaps to a paginated results table once the job succeeds.
+The system uses the components outlined in the project rubric, structured to ensure the web server never blocks while processing large datasets. Here is how the stack fits together:
+
+- **Next.js (Frontend):** Manages the user interface and the job lifecycle. It handles the initial file upload, continuously polls the backend to update the live progress bar, and renders the final processed data in a paginated table.
+- **Django (Backend API):** Serves as the routing and state management layer. It handles the API endpoints, tracks job progress in a SQLite database (`ProcessingJob` model), and enqueues tasks. By delegating all file parsing, LLM calls, and data processing to background workers, the request/response cycle remains instant.
+- **Celery + Redis (Asynchronous Task Queue):** Decouples the API from the slow processing work. Redis acts as both the message broker for Celery tasks (logical db 0) and a cache for the LLM-generated regex patterns (logical db 1). The Celery worker picks up the queued jobs, coordinates with the LLM, and orchestrates the Spark execution.
+- **PySpark (Distributed Data Engine):** Executes the actual text replacements at scale. Instead of iterating through rows sequentially in Python, PySpark applies the validated regex as a column expression (`regexp_replace`) across distributed data partitions.
+- **Polars (Data Utility):** Bridges the gaps between the web server and the distributed engine. Because PySpark does not natively support Excel, Polars is used in the worker to rapidly convert `.xls`/`.xlsx` files to CSVs. After processing, Django uses Polars' lazy evaluation (`scan_parquet().slice()`) to read only the requested page of the final Parquet files, allowing the API to serve paginated results instantly without loading millions of rows into server memory.
 
 ## How it works
 
@@ -55,16 +58,16 @@ The video walks through uploading a file, submitting a natural-language rule, wa
                                              └───────────────────┘
 ```
 
-### Frontend State Machine
+### Frontend Client Lifecycle
 
-```
-"" → INSPECTING → DRAFT → SUBMITTING → QUEUED → RUNNING → SUCCESS/FAILED
-```
+The UI is built around a strict state machine to ensure the user always knows what the system is doing, preventing duplicate submissions or silent timeouts:
 
-- **INSPECTING** — file is uploading (XHR progress bar) and/or a Celery worker is reading column names in the background.
-- **DRAFT** — file is on the server, column dropdown is populated; user fills in the form.
-- **QUEUED / RUNNING** — Celery worker is processing; progress bar polls `/api/status/` every 2s.
-- **SUCCESS / FAILED** — terminal states; results table or error message.
+`"" → INSPECTING → DRAFT → SUBMITTING → QUEUED → RUNNING → SUCCESS/FAILED`
+
+1. **Upload & Inspect (`INSPECTING`):** When a user drops a file, Next.js intercepts the upload using an XHR request to drive a real-time, byte-level progress bar. Once the file hits the server, the UI stays in this state while the background worker extracts the column headers.
+2. **Configure Rule (`DRAFT`):** With the file staged on the server, the UI unlocks the form and populates the dropdown with the newly discovered columns. The user selects their target and types their plain-English rule.
+3. **Execute & Monitor (`SUBMITTING` → `QUEUED` → `RUNNING`):** The user submits the rule. The UI instantly locks the form and initiates a 2-second polling loop. The progress bar swaps from tracking "upload bytes" to tracking actual Spark processing progress (10% → 50% → 95%).
+4. **Render Results (`SUCCESS` / `FAILED`):** Once a terminal state is reached, the polling loop shuts down. On success, the UI replaces the progress bar with a paginated data table, fetching only the first viewable chunk of rows. On failure, it catches and surfaces the error message to the user.
 
 ### Backend Request Flow
 

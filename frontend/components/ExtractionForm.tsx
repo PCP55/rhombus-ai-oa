@@ -1,8 +1,10 @@
-import React from "react";
-
 import type { JobResultData } from "../lib/api";
 
 // 1. The Interface Contract
+// ARCHITECTURE DECISION: This is a "Presentational" (or "Dumb") component.
+// It does not fetch data or manage its own state. The parent component (page.tsx)
+// owns the state and passes it down. This keeps the UI rendering completely
+// decoupled from the Next.js network logic.
 interface ExtractionFormProps {
     columns: string[];
     targetColumn: string;
@@ -12,7 +14,7 @@ interface ExtractionFormProps {
     replacement: string;
     setReplacement: (val: string) => void;
 
-    // Tracking Props
+    // Tracking Props (The State Machine)
     jobStatus: string;
     progress: number;
     resultData: JobResultData | null;
@@ -38,11 +40,17 @@ export default function ExtractionForm({
     onSubmit,
     onCancel,
 }: ExtractionFormProps) {
+
+    // DERIVED STATE: Instead of creating separate boolean states like `isSubmitting`
+    // or `isUploading` (which can get out of sync), we derive the UI locks directly
+    // from the single source of truth: `jobStatus`.
+
     // Locks the whole form down while a file is being inspected or a job is
     // being submitted/queued/run — none of these are safe moments to edit inputs.
     const isBusy = ["INSPECTING", "SUBMITTING", "QUEUED", "RUNNING"].includes(
         jobStatus,
     );
+
     // Only QUEUED/RUNNING jobs actually exist in Celery and can be cancelled.
     const isActive = ["QUEUED", "RUNNING"].includes(jobStatus);
     const hasColumns = columns.length > 0;
@@ -50,6 +58,9 @@ export default function ExtractionForm({
     return (
         <div className="space-y-6 mt-6">
             {/* --- User Input Section --- */}
+            {/* DEFENSIVE UX: Every input uses `disabled={isBusy}`. This prevents race
+                conditions, like a user changing the target column half a second
+                before the Celery worker starts processing. */}
             <div>
                 <label className="block text-sm font-medium text-gray-700 mb-1">
                     Target Column
@@ -61,6 +72,7 @@ export default function ExtractionForm({
                     className="w-full px-4 py-2 bg-gray-50 border border-gray-200 rounded-lg text-gray-900 disabled:opacity-50"
                 >
                     <option value="" disabled>
+                        {/* Dynamic placeholder based on the Two-Step Upload flow */}
                         {hasColumns
                             ? "Select a column…"
                             : "Upload a file to see its columns"}
@@ -112,6 +124,8 @@ export default function ExtractionForm({
                         className={`flex-1 font-medium py-3 rounded-lg text-white transition-colors
                             ${isBusy || !hasColumns ? "bg-gray-400 cursor-not-allowed" : "bg-gray-900 hover:bg-gray-800"}`}
                     >
+                        {/* IMMEDIATE VISUAL FEEDBACK: The button text acts as a
+                            mini-status indicator to let the user know their click registered. */}
                         {jobStatus === "SUBMITTING"
                             ? "Submitting..."
                             : isActive
@@ -119,7 +133,7 @@ export default function ExtractionForm({
                               : "Process Data"}
                     </button>
 
-                    {/* Only show Cancel button if actively processing */}
+                    {/* Conditional Rendering: Only show Cancel button if actively processing */}
                     {isActive && (
                         <button
                             type="button"
@@ -131,7 +145,8 @@ export default function ExtractionForm({
                     )}
                 </div>
 
-                {/* The Progress Bar (Only visible once a job is actually queued/running) */}
+                {/* The Progress Bar
+                    Only visible once a job is actively with Celery (QUEUED/RUNNING). */}
                 {isActive && (
                     <div className="w-full bg-gray-100 rounded-full h-2.5 overflow-hidden">
                         <div
@@ -144,7 +159,9 @@ export default function ExtractionForm({
                     </div>
                 )}
 
-                {/* Success Output */}
+                {/* Success Output
+                    Safeguard: We check both the status AND the existence of resultData
+                    to prevent null reference crashes if the API response is delayed. */}
                 {jobStatus === "SUCCESS" && resultData && (
                     <div className="p-4 bg-green-50 border border-green-200 rounded-lg">
                         <h3 className="text-green-800 font-medium">
